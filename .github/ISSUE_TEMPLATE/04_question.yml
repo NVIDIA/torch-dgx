@@ -1,0 +1,44 @@
+name: Ask a question
+description: Ask about installing, using, or contributing to torch-dgx.
+title: "[Question]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Search existing issues and read the [README](https://github.com/NVIDIA/torch-dgx/blob/master/README.md) before posting. Support is provided as maintainer and community time permits, without a guaranteed response time.
+
+        Use the bug report form for reproducible incorrect behavior. Report potential security vulnerabilities privately through [SECURITY.md](https://github.com/NVIDIA/torch-dgx/blob/master/SECURITY.md).
+
+  - type: textarea
+    id: question
+    attributes:
+      label: Question
+      description: What are you trying to do, and what would you like to understand?
+    validations:
+      required: true
+
+  - type: textarea
+    id: context
+    attributes:
+      label: What have you tried?
+      description: Include relevant documentation, related issues, commands, or a small code example. Remove credentials and private data.
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: For installation or runtime questions, include the torch-dgx version or commit, OS, Python, PyTorch, CUDA and driver versions, and GPU models and count.
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Submission checks
+      options:
+        - label: I searched the documentation and existing issues for an answer.
+          required: true
+        - label: I removed secrets, credentials, private links, and sensitive data from this question.
+          required: true

@@ -1,0 +1,3 @@
+__pycache__/
+build/
+torch_dgx/_C*.so

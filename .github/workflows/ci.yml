@@ -1,0 +1,185 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: BSD-3-Clause
+
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      # NVIDIA runners use branches created by copy-pr-bot for PR checks.
+      - "pull-request/[0-9]+"
+    tags:
+      - "**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref_type != 'tag' }}
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  UV_LINK_MODE: copy
+  UV_PYTHON_DOWNLOADS: never
+
+jobs:
+  build:
+    name: Build wheel (Linux x86_64)
+    runs-on:
+      group: nv-cpu-general
+      labels: linux-amd64-cpu16
+    timeout-minutes: 60
+    container:
+      # Keep PyTorch/CUDA versions aligned with the test job's runtime image.
+      image: pytorch/pytorch:2.14.0-cuda13.2-cudnn9-devel
+    env:
+      # L4 tests need sm_89; tags retain GitLab's broader architecture set.
+      TORCH_CUDA_ARCH_LIST: ${{ github.ref_type == 'tag' && '8.0;8.6;8.9;9.0+PTX' || '8.9' }}
+      CCACHE_BASEDIR: ${{ github.workspace }}
+      CCACHE_COMPILERCHECK: content
+      CCACHE_DIR: ${{ github.workspace }}/.cache/ccache
+      CCACHE_MAXSIZE: 5G
+      PYTORCH_NVCC: ccache nvcc
+      MAX_JOBS: "16"
+    steps:
+      - name: Get PR info
+        if: startsWith(github.ref, 'refs/heads/pull-request/')
+        uses: nv-gha-runners/get-pr-info@main
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Setup proxy cache
+        uses: nv-gha-runners/setup-proxy-cache@main
+        with:
+          enable-conda: false
+          enable-pypi-anaconda: false
+          enable-apt: true
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.12.9"
+          enable-cache: false
+
+      - name: Create CI virtual environment
+        run: |
+          # Inherit the image's PyTorch without modifying system Python.
+          uv venv --python "$(command -v python)" --system-site-packages "$RUNNER_TEMP/venv"
+          echo "VIRTUAL_ENV=$RUNNER_TEMP/venv" >> "$GITHUB_ENV"
+          echo "$RUNNER_TEMP/venv/bin" >> "$GITHUB_PATH"
+
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends build-essential ccache ninja-build
+          echo /usr/lib/ccache >> "$GITHUB_PATH"
+          # setup-proxy-cache configures pip; uv needs its own index setting.
+          export UV_DEFAULT_INDEX="$PIP_INDEX_URL"
+          uv pip install --python "$VIRTUAL_ENV/bin/python" --group build
+          python -c 'import sys, torch; print(sys.version); print(torch.__version__, torch.version.cuda)'
+          nvcc --version
+
+      - name: Restore compiler cache
+        uses: actions/cache@v4
+        with:
+          path: .cache/ccache
+          key: ccache-${{ runner.os }}-${{ runner.arch }}-pytorch2.14.0-cuda13.2-${{ env.TORCH_CUDA_ARCH_LIST }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ runner.os }}-${{ runner.arch }}-pytorch2.14.0-cuda13.2-${{ env.TORCH_CUDA_ARCH_LIST }}-
+
+      - name: Build wheel
+        run: |
+          ccache --zero-stats
+          uv build --wheel --no-build-isolation --python "$VIRTUAL_ENV/bin/python"
+
+      - name: Show compiler cache statistics
+        if: always()
+        run: ccache --show-stats
+
+      - name: Upload wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: torch-dgx-linux-x86_64-pytorch2.14.0-cuda13.2
+          path: dist/*.whl
+          if-no-files-found: error
+
+  test:
+    name: Test wheel (Linux x86_64, L4)
+    needs: build
+    runs-on:
+      group: nv-gpu-general
+      labels: linux-amd64-gpu-l4-latest-1
+    timeout-minutes: 60
+    container:
+      image: pytorch/pytorch:2.14.0-cuda13.2-cudnn9-runtime
+      options: --gpus all --ipc=host
+    env:
+      # Ignore unrelated pytest plugins bundled in the PyTorch image.
+      PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
+      PYTHONPATH: ""
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Setup proxy cache
+        uses: nv-gha-runners/setup-proxy-cache@main
+        with:
+          enable-conda: false
+          enable-pypi-anaconda: false
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.12.9"
+          enable-cache: false
+
+      - name: Create CI virtual environment
+        run: |
+          # Inherit the image's PyTorch without modifying system Python.
+          uv venv --python "$(command -v python)" --system-site-packages "$RUNNER_TEMP/venv"
+          echo "VIRTUAL_ENV=$RUNNER_TEMP/venv" >> "$GITHUB_ENV"
+          echo "$RUNNER_TEMP/venv/bin" >> "$GITHUB_PATH"
+
+      - name: Download wheel
+        uses: actions/download-artifact@v4
+        with:
+          name: torch-dgx-linux-x86_64-pytorch2.14.0-cuda13.2
+          path: dist
+
+      - name: Install wheel and test dependencies
+        run: |
+          export UV_DEFAULT_INDEX="$PIP_INDEX_URL"
+          uv pip install --python "$VIRTUAL_ENV/bin/python" --group test
+          # Keep the PyTorch and CUDA libraries supplied by the image.
+          uv pip install --python "$VIRTUAL_ENV/bin/python" --no-deps dist/*.whl
+
+      - name: Check GPUs and installed wheel
+        working-directory: ${{ runner.temp }}
+        run: |
+          nvidia-smi
+          python - <<'PY'
+          import torch
+          import torch_dgx
+
+          print(f"PyTorch {torch.__version__}, CUDA {torch.version.cuda}")
+          print(f"Installed torch-dgx: {torch_dgx.__file__}")
+          assert torch.cuda.is_available(), "CUDA is unavailable"
+          print(f"Visible GPUs: {torch.cuda.device_count()}")
+          PY
+
+      - name: Run tests
+        # Run outside the checkout so imports resolve to the installed wheel.
+        working-directory: ${{ runner.temp }}
+        run: python -m pytest -v -s "$GITHUB_WORKSPACE/tests/"

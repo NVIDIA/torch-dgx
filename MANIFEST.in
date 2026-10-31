@@ -1,0 +1,4 @@
+include build_config.py
+include CONTRIBUTING.md
+include docs/compatibility.md
+recursive-include source *.h *.cuh

@@ -1,0 +1,62 @@
+name: Request a feature
+description: Propose a torch-dgx capability or project improvement.
+title: "[Feature]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Describe the user problem before proposing a solution. Review [CONTRIBUTING.md](https://github.com/NVIDIA/torch-dgx/blob/master/CONTRIBUTING.md) for contribution requirements and the [supported layers and operators](https://github.com/NVIDIA/torch-dgx/blob/master/docs/pytorch_support.md) for current coverage.
+
+  - type: dropdown
+    id: request_type
+    attributes:
+      label: Request type
+      description: Select the option that best describes the requested change.
+      options:
+        - New feature
+        - Improvement to existing functionality
+        - Change to existing functionality
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or opportunity
+      description: Who is affected, what are they trying to do, why does it matter, and what concrete example or workload illustrates the need?
+    validations:
+      required: true
+
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Desired outcome
+      description: Describe the capability or result you would like without assuming a specific implementation. For operator support, include the PyTorch API and relevant shapes, dtypes, and layouts.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Describe current workarounds or other approaches you considered.
+    validations:
+      required: false
+
+  - type: textarea
+    id: additional_context
+    attributes:
+      label: Additional context
+      description: Add related issues, references, screenshots, technical constraints, or relevant compatibility, performance, security, hardware, or dependency considerations, including the GPU configuration and PyTorch or CUDA versions where applicable.
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Submission checks
+      options:
+        - label: I searched existing issues and the supported layers and operators for a similar request.
+          required: true
+        - label: I reviewed [CONTRIBUTING.md](https://github.com/NVIDIA/torch-dgx/blob/master/CONTRIBUTING.md).
+          required: true

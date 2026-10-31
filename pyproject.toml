@@ -1,0 +1,103 @@
+[build-system]
+requires = [
+    "nvidia-cutlass",
+    "packaging>=24.2",
+    "setuptools>=77",
+    "torch>=2.10.0",
+]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "torch-dgx"
+version = "1.0.0"
+description = "A multi-GPU DGX-oriented backend for PyTorch"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "BSD-3-Clause"
+license-files = [
+    "LICENSE",
+    "licenses/pytorch-LICENSE.txt",
+    "licenses/cccl-LICENSE.txt",
+    "licenses/cutlass-LICENSE.txt",
+    "licenses/pybind11-LICENSE.txt",
+]
+dependencies = [
+    "numpy",
+    "torch>=2.10.0",
+]
+
+[dependency-groups]
+build = [
+    "nvidia-cutlass",
+    "packaging>=24.2",
+    "setuptools>=77",
+]
+test = ["pytest"]
+
+[tool.uv]
+default-groups = ["build", "test"]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu132" }
+
+[[tool.uv.index]]
+name = "pytorch-cu132"
+url = "https://download.pytorch.org/whl/cu132"
+explicit = true
+
+[tool.setuptools]
+packages = ["torch_dgx"]
+cmdclass = { build_ext = "build_config.EditableBuildExtension" }
+
+[[tool.setuptools.ext-modules]]
+name = "torch_dgx._C"
+sources = [
+    "source/Activation.cu",
+    "source/Attention.cu",
+    "source/BinaryOps.cu",
+    "source/DGXAllocator.cpp",
+    "source/DGXBackend.cpp",
+    "source/DGXGenerator.cpp",
+    "source/ComparisonOps.cu",
+    "source/Convolution.cu",
+    "source/Copy.cu",
+    "source/Distribution.cu",
+    "source/Dropout.cu",
+    "source/ElementwiseOps.cu",
+    "source/Embedding.cu",
+    "source/EmptyTensor.cpp",
+    "source/Equal.cu",
+    "source/EventUtils.cpp",
+    "source/Fill.cu",
+    "source/Foreach.cu",
+    "source/FusedAdam.cu",
+    "source/IndexKernel.cu",
+    "source/Lerp.cu",
+    "source/Linear.cu",
+    "source/LinearAlgebra.cu",
+    "source/Loss.cu",
+    "source/NLLLoss.cu",
+    "source/Nonzero.cu",
+    "source/Normalization.cu",
+    "source/Random.cu",
+    "source/RangeFactories.cu",
+    "source/ReduceAll.cu",
+    "source/ReduceArg.cu",
+    "source/ReduceAny.cu",
+    "source/ReduceScalar.cu",
+    "source/ReductionLayout.cu",
+    "source/ReflectionPad.cu",
+    "source/Resize.cpp",
+    "source/Scalar.cpp",
+    "source/ScalarReductionUtils.cpp",
+    "source/Shape.cu",
+    "source/Softmax.cu",
+    "source/Sort.cu",
+    "source/Statistics.cu",
+    "source/StridedTensorUtils.cu",
+    "source/CumulativeSum.cu",
+    "source/Sum.cu",
+    "source/TensorUtils.cpp",
+    "source/Upsampling.cu",
+    "source/UnaryOps.cu",
+]
