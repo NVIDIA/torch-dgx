@@ -203,7 +203,8 @@ ForeachResult<Inplace> foreach_apply(ArrayRef<TensorList> lists,
                            for (const auto i : c10::irange(lists[0].size()))
                            {
                                // Match the logical ownership used by other DGX pointwise kernels.
-                               const auto [offset, size] = chunk(lists[0][i].numel(), device);
+                               size_t offset, size;
+                               std::tie(offset, size) = partition::range(lists[0][i].numel(), device);
                                if (!size)
                                    continue;
                                batch.blocks += ::cuda::ceil_div(static_cast<int64_t>(size), kForeachBlockSize);

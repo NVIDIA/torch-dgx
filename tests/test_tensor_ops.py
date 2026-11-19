@@ -7,6 +7,43 @@ datatypes = [torch.int32, torch.int64, torch.float32, torch.float64]
 
 
 @pytest.mark.parametrize(
+    "shape, dims, dtype",
+    [
+        ((3, 4, 5), [], torch.float32),
+        ((3, 4, 5), [0], torch.int64),
+        ((3, 4, 5), [-1], torch.float16),
+        ((3, 4, 5), [0, -1], torch.complex64),
+        ((3, 4, 5), [0, -1], torch.bool),
+        ((), [0], torch.float32),
+        ((3, 0), [-1], torch.float32),
+        ((3, 1), [1], torch.float32),
+    ],
+)
+def test_flip(dgx_setup_teardown, shape, dims, dtype):
+    source = torch.randint(0, 10, shape).to(dtype)
+    tensor = source.to("dgx")
+    if len(shape) == 3:
+        source = source.transpose(0, 1)[..., 1::2]
+        tensor = tensor.transpose(0, 1)[..., 1::2]
+    actual = tensor.flip(dims)
+    torch.testing.assert_close(actual.cpu(), source.flip(dims))
+    if tensor.numel():
+        assert actual.data_ptr() != tensor.data_ptr()
+    torch.testing.assert_close(tensor.cpu(), source)
+
+
+def test_flip_invalid_dims_and_backward(dgx_setup_teardown):
+    tensor = torch.ones(2, 3, device="dgx", requires_grad=True)
+    with pytest.raises(RuntimeError, match="multiple times"):
+        tensor.flip([0, -2])
+    with pytest.raises(IndexError, match="Dimension out of range"):
+        tensor.flip([2])
+    weights = torch.arange(6, dtype=tensor.dtype).reshape(2, 3)
+    (tensor.flip([0, 1]) * weights.to("dgx")).sum().backward()
+    torch.testing.assert_close(tensor.grad.cpu(), weights.flip([0, 1]))
+
+
+@pytest.mark.parametrize(
     "dtype, complex_dtype",
     [
         (torch.float16, torch.complex32),
@@ -234,8 +271,12 @@ def test_cat_all_empty(dgx_setup_teardown, dim):
 
 @pytest.mark.parametrize("batch_shape", [(), (1,), (3,)])
 def test_cat_promoted_uneven_chunks(dgx_setup_teardown, batch_shape):
-    a = torch.arange(torch.Size((*batch_shape, 5, 5)).numel(), dtype=torch.int32).reshape(*batch_shape, 5, 5)
-    b = torch.arange(torch.Size((*batch_shape, 5, 3)).numel(), dtype=torch.int64).reshape(*batch_shape, 5, 3)
+    a = torch.arange(
+        torch.Size((*batch_shape, 5, 5)).numel(), dtype=torch.int32
+    ).reshape(*batch_shape, 5, 5)
+    b = torch.arange(
+        torch.Size((*batch_shape, 5, 3)).numel(), dtype=torch.int64
+    ).reshape(*batch_shape, 5, 3)
     actual = torch.cat([a.to("dgx"), b.to("dgx")], dim=-1)
     torch.testing.assert_close(actual.cpu(), torch.cat([a, b], dim=-1))
 
@@ -269,11 +310,15 @@ def test_cat_camera_features_backward(dgx_setup_teardown, cameras, count):
         torch.testing.assert_close(tensor.grad.cpu(), cpu_tensor.grad, rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("lengths", [(1, 0, 2), (2, 19, 1), (19, 1, 2), (262_147, 0, 17)])
+@pytest.mark.parametrize(
+    "lengths", [(1, 0, 2), (2, 19, 1), (19, 1, 2), (262_147, 0, 17)]
+)
 @pytest.mark.parametrize("width", [1, 3])
 def test_cat_append_backward(dgx_setup_teardown, lengths, width):
     cpu_inputs = [
-        (torch.arange(length * width).reshape(length, width) % 31).float().requires_grad_()
+        (torch.arange(length * width).reshape(length, width) % 31)
+        .float()
+        .requires_grad_()
         for length in lengths
     ]
     inputs = [tensor.detach().to("dgx").requires_grad_() for tensor in cpu_inputs]

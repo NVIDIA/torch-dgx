@@ -121,14 +121,11 @@ auto configure_attention_kernel(int shared_memory)
             if (major < 8 || available_shared_memory < shared_memory)
                 return nullptr;
         }
-        int current_device;
-        C10_CUDA_CHECK(cudaGetDevice(&current_device));
         for (const auto device : c10::irange(c10::cuda::device_count()))
         {
             C10_CUDA_CHECK(cudaSetDevice(device));
             C10_CUDA_CHECK(cudaFuncSetAttribute(Kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shared_memory));
         }
-        C10_CUDA_CHECK(cudaSetDevice(current_device));
         return Kernel;
     }();
     return kernel;
@@ -473,7 +470,7 @@ void reduce_attention_partials(const AttentionPartition& partition, const Tensor
     // physical output so peers write disjoint spans rather than interleaved heads.
     // Enqueue independent dK/dV reductions together; the caller joins once.
     parallel_for_each_async([&](int device, cudaStream_t stream) {
-        const auto [begin, count] = aligned_chunk(1, gradient.numel(), device);
+        const auto [begin, count] = partition::aligned_range(1, gradient.numel(), device);
         if (!count)
             return;
         const auto blocks =
@@ -600,7 +597,7 @@ void merge_attention_partials(const AttentionPartition& partition,
     const int64_t lse_rows = partial_lse.size(2);
     const int64_t rows = output.size(0) * output.size(1) * lse_rows;
     parallel_for_each([&](int device, cudaStream_t stream) {
-        const auto [begin, count] = aligned_chunk(1, rows, device);
+        const auto [begin, count] = partition::aligned_range(1, rows, device);
         if (!count)
             return;
         const auto blocks =
@@ -770,9 +767,6 @@ std::tuple<Tensor, Tensor, Tensor, Tensor> efficient_attention(const Tensor& que
         // bias also needs it, even when all three attention inputs are frozen.
         compute_log_sumexp |= attn_bias->requires_grad();
     }
-    int current_device;
-    C10_CUDA_CHECK(cudaGetDevice(&current_device));
-    auto restore_device = c10::make_scope_exit([&] { C10_CUDA_CHECK_WARN(cudaSetDevice(current_device)); });
     auto output = empty_attention_tensor(query, value.size(3));
     const int64_t lse_size = compute_log_sumexp ? ::cuda::ceil_div(query.size(2), int64_t{ 32 }) * 32 : 0;
     auto logsumexp = at::empty({ query.size(0), query.size(1), lse_size }, query.options());
@@ -954,9 +948,6 @@ std::tuple<Tensor, Tensor, Tensor, Tensor> efficient_attention_backward(const Te
     TORCH_CHECK(logsumexp.device() == query.device() && logsumexp.scalar_type() == kFloat &&
                     logsumexp.sizes() == IntArrayRef(lse_shape) && logsumexp.is_contiguous(),
                 "DGX efficient attention backward requires the saved logsumexp");
-    int current_device;
-    C10_CUDA_CHECK(cudaGetDevice(&current_device));
-    auto restore_device = c10::make_scope_exit([&] { C10_CUDA_CHECK_WARN(cudaSetDevice(current_device)); });
     auto grad_query = grad_input_mask[0] ? empty_attention_tensor(query, query.size(3)) : Tensor();
     auto grad_key = grad_input_mask[1] ? empty_attention_tensor(key, key.size(3)) : Tensor();
     auto grad_value = grad_input_mask[2] ? empty_attention_tensor(value, value.size(3)) : Tensor();
@@ -1164,7 +1155,8 @@ std::tuple<Tensor, Tensor, Tensor, Tensor> efficient_attention_backward(const Te
         });
     });
     if (reduce_query)
-        nccl_reduce_scatter_partials(query_partials, grad_query.data_ptr<float>(), grad_query.numel(), query.size(3));
+        nccl_reduce_scatter_dense_partials(
+            query_partials, grad_query.data_ptr<float>(), grad_query.numel(), query.size(3));
     merge_streams();
     reduce_attention_partials(partition, partial_key, grad_key);
     reduce_attention_partials(partition, partial_value, grad_value);

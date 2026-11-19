@@ -3,9 +3,12 @@
  * SPDX-License-Identifier: BSD-3-Clause
  */
 #include "ScalarReductionUtils.h"
-#include "TensorUtils.h"
 
+#include "PartitionUtils.h"
+
+#include <c10/cuda/CUDAException.h>
 #include <c10/cuda/CUDAStream.h>
+#include <c10/util/irange.h>
 
 #include <vector>
 
@@ -32,7 +35,6 @@ void run_reduce(Reduce reduce, cudaStream_t stream)
 
 void scalar_reduce(int64_t numel, ScalarReductionFn reduce, ScalarReductionMergeFn merge, bool broadcast_result)
 {
-    // The operator restores the device after releasing its temporary tensors.
     std::vector<cudaEvent_t> events(c10::cuda::device_count(), nullptr);
     cudaEvent_t merge_event = nullptr;
 
@@ -41,7 +43,7 @@ void scalar_reduce(int64_t numel, ScalarReductionFn reduce, ScalarReductionMerge
         C10_CUDA_CHECK(cudaSetDevice(device));
         auto stream = c10::cuda::getCurrentCUDAStream(device);
         int64_t offset, count;
-        std::tie(offset, count) = chunk(numel, device);
+        std::tie(offset, count) = partition::range(numel, device);
         run_reduce(
             [&](void* temp_storage, size_t& temp_storage_bytes) {
                 return reduce(temp_storage, temp_storage_bytes, device, offset, count, stream);

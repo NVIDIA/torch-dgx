@@ -84,11 +84,10 @@ void nll_reduce(
     static_assert(sizeof(NLLSum<acc_t>) == 2 * sizeof(acc_t));
     const Tensor sums = at::empty({ 2 }, output.options().dtype<acc_t>());
     std::vector<acc_t*> partials(c10::cuda::device_count());
-    int current_device = cudaInvalidDeviceId;
-    C10_CUDA_CHECK(cudaGetDevice(&current_device));
     parallel_for_each_async([&](int device, cudaStream_t stream) {
         C10_CUDA_CHECK(cudaMallocAsync(&partials[device], 2 * sizeof(acc_t), stream));
-        const auto [offset, size] = chunk(count, device);
+        size_t offset, size;
+        std::tie(offset, size) = partition::range(count, device);
         if (size)
         {
             const auto indices = thrust::make_counting_iterator<int64_t>(offset);
@@ -113,7 +112,6 @@ void nll_reduce(
         sums.const_data_ptr<acc_t>(), reduction, output.data_ptr<scalar_t>(), total_weight.data_ptr<scalar_t>());
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     parallel_for_each([&](int device, cudaStream_t stream) { C10_CUDA_CHECK(cudaFreeAsync(partials[device], stream)); });
-    C10_CUDA_CHECK(cudaSetDevice(current_device));
 }
 
 template <typename scalar_t, typename target_t>

@@ -31,8 +31,6 @@ Scalar _local_scalar_dense_dgx(const Tensor& self)
 
     // DGX producers already order their results on GPU 0's current stream.
     // Only the scalar copy needs a host wait; another peer-stream fan-in is redundant.
-    int current_device = cudaInvalidDeviceId;
-    C10_CUDA_CHECK(cudaGetDevice(&current_device));
     constexpr int merge_device_id = 0;
     C10_CUDA_CHECK(cudaSetDevice(merge_device_id));
     auto merge_stream = c10::cuda::getCurrentCUDAStream(merge_device_id);
@@ -55,7 +53,6 @@ Scalar _local_scalar_dense_dgx(const Tensor& self)
                    AT_EXPAND(AT_ALL_TYPES_AND_COMPLEX), kComplexHalf, kHalf, kBool, kBFloat16,
                    AT_EXPAND(AT_FLOAT8_TYPES), AT_EXPAND(AT_BAREBONES_UNSIGNED_TYPES));
 
-    C10_CUDA_CHECK(cudaSetDevice(current_device));
     return r;
 }
 

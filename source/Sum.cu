@@ -20,6 +20,8 @@
 #include <thrust/iterator/counting_iterator.h>
 #include <thrust/iterator/transform_iterator.h>
 
+#include <limits>
+
 namespace at::native
 {
 
@@ -34,6 +36,10 @@ namespace
 constexpr int64_t kDim1BlockReduceMinReductionSize = kNumThreads;
 constexpr int kDim1TileColumns = 32;
 constexpr int kDim1TileRows = kNumThreads / kDim1TileColumns;
+constexpr int kDim0TileColumns = 32;
+constexpr int kDim0TileRows = kNumThreads / kDim0TileColumns;
+constexpr int64_t kDim0RowsPerPartition = 1024;
+constexpr int64_t kDim0MaxPartitions = 1024;
 
 template <typename InputIteratorT, typename accscalar_t>
 void sum_async(int64_t numel, InputIteratorT in, accscalar_t* out)
@@ -54,7 +60,7 @@ void sum_async(int64_t numel, InputIteratorT in, accscalar_t* out)
         auto stream = c10::cuda::getCurrentCUDAStream(device_id);
 
         int64_t device_offset, device_numel;
-        std::tie(device_offset, device_numel) = chunk(numel, device_id);
+        std::tie(device_offset, device_numel) = partition::range(numel, device_id);
         auto device_in = in + device_offset;
 
         size_t scratch_size = 0;
@@ -125,7 +131,7 @@ void mean_async(int64_t numel, InputIteratorT in, accscalar_t* out)
         auto stream = c10::cuda::getCurrentCUDAStream(device_id);
 
         int64_t device_offset, device_numel;
-        std::tie(device_offset, device_numel) = chunk(numel, device_id);
+        std::tie(device_offset, device_numel) = partition::range(numel, device_id);
         auto device_in = in + device_offset;
 
         size_t scratch_size = 0;
@@ -170,7 +176,7 @@ struct RowSumTransform
     }
 };
 
-template <typename output_t, typename acc_t>
+template <typename output_t, typename acc_t = at::acc_type<output_t, true>>
 struct RowSumOutput
 {
     output_t* output;
@@ -182,7 +188,7 @@ struct RowSumOutput
     }
 };
 
-template <typename output_t, typename acc_t>
+template <typename output_t, typename acc_t = at::acc_type<output_t, true>>
 struct RowMeanOutput
 {
     output_t* output;
@@ -195,21 +201,91 @@ struct RowMeanOutput
     }
 };
 
+template <typename scalar_t, typename OutputOp>
+void reduce_sum_dimension(const Tensor& input, int64_t dim, const Tensor& output, OutputOp output_op)
+{
+    using accscalar_t = at::acc_type<scalar_t, true>;
+    const auto layout =
+        make_reduction_layout<2>(input.sizes(), dim, std::array<IntArrayRef, 2>{ input.strides(), output.strides() });
+    row_reduce<scalar_t, accscalar_t>(input.const_data_ptr<scalar_t>(), layout, RowSumTransform<scalar_t, accscalar_t>(),
+                                      ::cuda::std::plus<accscalar_t>(), accscalar_t(0), output_op);
+}
+
+template <typename accscalar_t>
+__device__ accscalar_t sum_tile_rows(accscalar_t value)
+{
+    __shared__ accscalar_t values[kDim0TileRows][kDim0TileColumns];
+    values[threadIdx.y][threadIdx.x] = value;
+    __syncthreads();
+    if (threadIdx.y == 0)
+        for (int row = 1; row < kDim0TileRows; ++row)
+            value += values[row][threadIdx.x];
+    return value;
+}
+
 template <typename scalar_t, typename accscalar_t>
 __global__ void sum_kernel_2d(int64_t count,
                               int64_t row_offset,
                               int64_t row_count,
                               const PackedTensorAccessor64<scalar_t, 2, RestrictPtrTraits> self,
-                              accscalar_t* out)
+                              accscalar_t* out,
+                              int devices)
 {
-    auto col = threadIdx.x + blockIdx.x * blockDim.x;
-    if (col < count)
+    const auto packed_col = static_cast<int64_t>(threadIdx.x) + static_cast<int64_t>(blockIdx.x) * blockDim.x;
+    accscalar_t acc = 0;
+    if (packed_col < count)
     {
-        accscalar_t acc = 0;
-        for (auto row = row_offset; row < row_offset + row_count; ++row)
-            acc += static_cast<accscalar_t>(self[row][col]);
-        out[col] = acc;
+        const auto col = partition::logical_index(1, self.size(1), devices, packed_col);
+        const auto first_row = row_offset + partition::offset(1, row_count, gridDim.y, blockIdx.y);
+        const auto rows = partition::count(1, row_count, gridDim.y, blockIdx.y);
+        if (col < self.size(1))
+            for (auto row = first_row + threadIdx.y; row < first_row + rows; row += blockDim.y)
+                acc += static_cast<accscalar_t>(self[row][col]);
     }
+    acc = sum_tile_rows(acc);
+    if (threadIdx.y == 0 && packed_col < count)
+        out[static_cast<int64_t>(blockIdx.y) * count + packed_col] = acc;
+}
+
+template <typename scalar_t, typename accscalar_t>
+__global__ void sum_kernel_3d(int64_t count,
+                              int64_t row_offset,
+                              int64_t row_count,
+                              const PackedTensorAccessor64<scalar_t, 3, RestrictPtrTraits> self,
+                              accscalar_t* out,
+                              int devices)
+{
+    const auto packed_col = static_cast<int64_t>(threadIdx.x) + static_cast<int64_t>(blockIdx.x) * blockDim.x;
+    accscalar_t acc = 0;
+    if (packed_col < count)
+    {
+        const auto columns = self.size(1) * self.size(2);
+        const auto col = partition::logical_index(1, columns, devices, packed_col);
+        const auto first_row = row_offset + partition::offset(1, row_count, gridDim.y, blockIdx.y);
+        const auto rows = partition::count(1, row_count, gridDim.y, blockIdx.y);
+        if (col < columns)
+        {
+            const auto column_offset = (col / self.size(2)) * self.stride(1) + (col % self.size(2)) * self.stride(2);
+            for (auto row = first_row + threadIdx.y; row < first_row + rows; row += blockDim.y)
+                acc += static_cast<accscalar_t>(self.data()[row * self.stride(0) + column_offset]);
+        }
+    }
+    acc = sum_tile_rows(acc);
+    if (threadIdx.y == 0 && packed_col < count)
+        out[static_cast<int64_t>(blockIdx.y) * count + packed_col] = acc;
+}
+
+template <typename accscalar_t>
+__global__ void sum_kernel_dim0_partials(int64_t count, int64_t partitions, const accscalar_t* partials, accscalar_t* out)
+{
+    const auto col = static_cast<int64_t>(threadIdx.x) + static_cast<int64_t>(blockIdx.x) * blockDim.x;
+    accscalar_t acc = 0;
+    if (col < count)
+        for (int64_t row = threadIdx.y; row < partitions; row += blockDim.y)
+            acc += partials[row * count + col];
+    acc = sum_tile_rows(acc);
+    if (threadIdx.y == 0 && col < count)
+        out[col] = acc;
 }
 
 template <typename accscalar_t>
@@ -218,30 +294,6 @@ __device__ accscalar_t block_sum(accscalar_t value)
     using BlockReduce = cub::BlockReduce<accscalar_t, kNumThreads>;
     __shared__ typename BlockReduce::TempStorage temp_storage;
     return BlockReduce(temp_storage).Sum(value);
-}
-
-template <typename scalar_t, typename accscalar_t>
-__global__ void sum_kernel_3d_dim0(int64_t count,
-                                   int64_t offset,
-                                   const PackedTensorAccessor64<scalar_t, 3, RestrictPtrTraits> self,
-                                   accscalar_t* out,
-                                   StridedOffsetCalculator<1> output_offsets)
-{
-    auto output_index = threadIdx.x + blockIdx.x * blockDim.x;
-    if (output_index < count)
-    {
-        auto linear_index = output_index + offset;
-        auto j = linear_index / self.size(2);
-        auto k = linear_index % self.size(2);
-
-        accscalar_t acc = 0;
-#pragma unroll
-        for (auto i = 0; i < self.size(0); ++i)
-        {
-            acc += static_cast<accscalar_t>(self[i][j][k]);
-        }
-        out[output_offsets.get(linear_index)[0]] = acc;
-    }
 }
 
 template <bool block_reduce = true, typename scalar_t, typename accscalar_t>
@@ -325,34 +377,76 @@ __global__ __launch_bounds__(kNumThreads) void sum_kernel_3d_dim1_tiled(
     }
 }
 
+template <typename scalar_t>
+void sum_dim0(const Tensor& input, Tensor& out)
+{
+    using accscalar_t = at::acc_type<scalar_t, true>;
+    // Reduce each GPU's row shard, then combine the partial vectors.
+    const auto num_cols = input.dim() == 2 ? input.size(1) : input.size(1) * input.size(2);
+    const auto padded_numel = nccl_reduce_scatter_padded_numel(num_cols);
+    std::vector<accscalar_t*> partials(c10::cuda::device_count());
+
+    parallel_for_each_async([&](int device, cudaStream_t stream) {
+        int64_t row_offset, row_count;
+        std::tie(row_offset, row_count) = partition::range(input.size(0), device);
+        C10_CUDA_CHECK(cudaMallocAsync(&partials[device], padded_numel * sizeof(accscalar_t), stream));
+        // Parallelize the long reduction dimension as well as the columns.
+        // Bound scratch to 1024 partial vectors per GPU; empty shards write zeros.
+        const auto partitions =
+            std::max<int64_t>(1, std::min(::cuda::ceil_div(row_count, kDim0RowsPerPartition), kDim0MaxPartitions));
+        const auto num_blocks = static_cast<unsigned int>(::cuda::ceil_div(padded_numel, kDim0TileColumns));
+        const dim3 threads(kDim0TileColumns, kDim0TileRows);
+        accscalar_t* scratch_data = nullptr;
+        TORCH_CHECK(padded_numel <= std::numeric_limits<size_t>::max() / partitions / sizeof(accscalar_t),
+                    "sum dimension-0 partial buffer size overflow");
+        C10_CUDA_CHECK(cudaMallocAsync(&scratch_data, partitions * padded_numel * sizeof(accscalar_t), stream));
+        if (input.dim() == 2)
+        {
+            sum_kernel_2d<<<dim3(num_blocks, partitions), threads, 0, stream>>>(
+                padded_numel, row_offset, row_count, input.packed_accessor64<scalar_t, 2, RestrictPtrTraits>(),
+                scratch_data, c10::cuda::device_count());
+        }
+        else
+        {
+            sum_kernel_3d<<<dim3(num_blocks, partitions), threads, 0, stream>>>(
+                padded_numel, row_offset, row_count, input.packed_accessor64<scalar_t, 3, RestrictPtrTraits>(),
+                scratch_data, c10::cuda::device_count());
+        }
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+        sum_kernel_dim0_partials<<<num_blocks, threads, 0, stream>>>(
+            padded_numel, partitions, scratch_data, partials[device]);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+        C10_CUDA_CHECK(cudaFreeAsync(scratch_data, stream));
+    });
+
+    auto result = out.is_contiguous() ? out : at::empty(out.sizes(), out.options());
+    nccl_reduce_scatter_packed_partials(partials, result.data_ptr<accscalar_t>(), num_cols);
+    parallel_for_each_async(
+        [&](int device, cudaStream_t stream) { C10_CUDA_CHECK(cudaFreeAsync(partials[device], stream)); });
+    merge_streams();
+    if (!out.is_same(result))
+        out.copy_(result);
+}
+
 } // namespace
 
 void sum_dimension(const Tensor& input, int64_t dim, Tensor& output)
 {
-    const auto layout =
-        make_reduction_layout<2>(input.sizes(), dim, std::array<IntArrayRef, 2>{ input.strides(), output.strides() });
     AT_DISPATCH_V2(input.scalar_type(), "sum_out", AT_WRAP([&] {
-                       using accscalar_t = at::acc_type<scalar_t, true>;
-                       row_reduce<scalar_t, accscalar_t>(
-                           input.const_data_ptr<scalar_t>(), layout, RowSumTransform<scalar_t, accscalar_t>(),
-                           ::cuda::std::plus<accscalar_t>(), accscalar_t(0),
-                           RowSumOutput<scalar_t, accscalar_t>{ output.data_ptr<scalar_t>() });
+                       reduce_sum_dimension<scalar_t>(
+                           input, dim, output, RowSumOutput<scalar_t>{ output.data_ptr<scalar_t>() });
                    }),
                    AT_EXPAND(AT_ALL_TYPES));
 }
 
 Tensor& sum_out(const Tensor& self, OptionalIntArrayRef dim, bool keepdim, std::optional<ScalarType> dtype, Tensor& out)
 {
-    int device = cudaInvalidDeviceId;
-    C10_CUDA_CHECK(cudaGetDevice(&device));
-
     // Floating sums use the output dtype; integer/bool sums can accumulate without promoting the input.
     const auto input_dtype = dtype.value_or(self.is_floating_point() ? out.scalar_type() : self.scalar_type());
     auto in = self.to(input_dtype);
 
     if (!out.numel())
     {
-        C10_CUDA_CHECK(cudaSetDevice(device));
         return out;
     }
 
@@ -405,7 +499,7 @@ Tensor& sum_out(const Tensor& self, OptionalIntArrayRef dim, bool keepdim, std::
             AT_DISPATCH_V2(
                 out.scalar_type(), "sum_out", AT_WRAP([&] {
                     int64_t device_offset, device_numel;
-                    std::tie(device_offset, device_numel) = chunk(in.numel(), device);
+                    std::tie(device_offset, device_numel) = partition::range(in.numel(), device);
                     const auto input = in.const_data_ptr<scalar_t>();
                     auto output = out.data_ptr<scalar_t>();
                     C10_CUDA_CHECK(cudaMemcpyAsync(output + device_offset, input + device_offset,
@@ -416,68 +510,8 @@ Tensor& sum_out(const Tensor& self, OptionalIntArrayRef dim, bool keepdim, std::
     }
     else if ((*dim).size() == 1 && (*dim)[0] == 0 && (in.dim() == 2 || in.dim() == 3))
     {
-        if (in.dim() == 2)
-        {
-            AT_DISPATCH_V2(
-                in.scalar_type(), "sum_out", AT_WRAP([&] {
-                    using accscalar_t = at::acc_type<scalar_t, true>;
-                    // Bias gradients reduce rows. Compute each GPU's local-row partial and combine the
-                    // partial vectors instead of making every GPU scan the full managed tensor.
-                    const auto num_cols = in.size(1);
-                    const auto padded_numel = nccl_reduce_scatter_padded_numel(num_cols);
-
-                    std::vector<accscalar_t*> partials(c10::cuda::device_count());
-
-                    parallel_for_each_async([&](int device, cudaStream_t stream) {
-                        int64_t row_offset, row_count;
-                        std::tie(row_offset, row_count) = chunk(in.size(0), device);
-                        C10_CUDA_CHECK(cudaMallocAsync(&partials[device], padded_numel * sizeof(accscalar_t), stream));
-                        if (padded_numel > num_cols)
-                            C10_CUDA_CHECK(cudaMemsetAsync(partials[device] + num_cols, 0,
-                                                           (padded_numel - num_cols) * sizeof(accscalar_t), stream));
-                        const auto num_blocks = static_cast<unsigned int>(::cuda::ceil_div(num_cols, kNumThreads));
-                        sum_kernel_2d<<<num_blocks, kNumThreads, 0, stream>>>(
-                            num_cols, row_offset, row_count, in.packed_accessor64<scalar_t, 2, RestrictPtrTraits>(),
-                            partials[device]);
-                        C10_CUDA_KERNEL_LAUNCH_CHECK();
-                    });
-
-                    auto result = out.is_contiguous() ? out : at::empty(out.sizes(), out.options());
-                    nccl_reduce_scatter_partials(partials, result.data_ptr<accscalar_t>(), num_cols);
-
-                    parallel_for_each_async([&](int device, cudaStream_t stream) {
-                        C10_CUDA_CHECK(cudaFreeAsync(partials[device], stream));
-                    });
-                    merge_streams();
-                    if (!out.is_same(result))
-                        out.copy_(result);
-                }),
-                AT_EXPAND(AT_FLOATING_TYPES));
-        }
-        else if (in.dim() == 3)
-        {
-            parallel_for_each([&](int device, cudaStream_t stream) {
-                int64_t device_offset, device_numel;
-                std::tie(device_offset, device_numel) = chunk(in.size(1) * in.size(2), device);
-                const unsigned int device_num_blocks = ::cuda::ceil_div(device_numel, kNumThreads);
-
-                AT_DISPATCH_V2(
-                    in.scalar_type(), "sum_out", AT_WRAP([&] {
-                        using accscalar_t = at::acc_type<scalar_t, true>;
-                        auto output_offsets =
-                            make_strided_offset_calculator<1>(out.sizes(), std::array<IntArrayRef, 1>{ out.strides() });
-                        sum_kernel_3d_dim0<<<device_num_blocks, kNumThreads, 0, stream>>>(
-                            device_numel, device_offset, in.packed_accessor64<scalar_t, 3, RestrictPtrTraits>(),
-                            out.data_ptr<accscalar_t>(), output_offsets);
-                    }),
-                    AT_EXPAND(AT_FLOATING_TYPES));
-                C10_CUDA_KERNEL_LAUNCH_CHECK();
-            });
-        }
-        else
-        {
-            TORCH_CHECK(false, "Unsupported configuration in sum_out");
-        }
+        AT_DISPATCH_V2(
+            in.scalar_type(), "sum_out", AT_WRAP([&] { sum_dim0<scalar_t>(in, out); }), AT_EXPAND(AT_FLOATING_TYPES));
     }
     else if ((*dim).size() == 1 && in.dim() == 3 && ((*dim)[0] == 1 || (*dim)[0] == -2))
     {
@@ -497,7 +531,7 @@ Tensor& sum_out(const Tensor& self, OptionalIntArrayRef dim, bool keepdim, std::
 
                 parallel_for_each([&](int device, cudaStream_t stream) {
                     int64_t device_offset, device_numel;
-                    std::tie(device_offset, device_numel) = chunk(output_numel, device);
+                    std::tie(device_offset, device_numel) = partition::range(output_numel, device);
                     if (!device_numel)
                     {
                         return;
@@ -559,17 +593,21 @@ Tensor& sum_out(const Tensor& self, OptionalIntArrayRef dim, bool keepdim, std::
         }
     }
 
-    C10_CUDA_CHECK(cudaSetDevice(device));
-
     return out;
 }
 
 Tensor& mean_out(const Tensor& self, OptionalIntArrayRef dim, bool keepdim, std::optional<ScalarType> dtype, Tensor& out)
 {
-    int device = cudaInvalidDeviceId;
-    C10_CUDA_CHECK(cudaGetDevice(&device));
+    if (!out.numel())
+    {
+        return out;
+    }
+    if (!self.numel())
+    {
+        return out.fill_(std::numeric_limits<double>::quiet_NaN());
+    }
 
-    auto in = dtype ? self.to(dtype.value()) : self;
+    auto in = self.to(dtype.value_or(out.scalar_type()));
 
     if (!dim || (*dim).empty() || out.numel() == 1)
     {
@@ -591,31 +629,13 @@ Tensor& mean_out(const Tensor& self, OptionalIntArrayRef dim, bool keepdim, std:
                        }),
                        AT_EXPAND(AT_FLOATING_TYPES));
     }
-    else if ((*dim).size() == 1 && in.size((*dim)[0]) == 1)
+    else if ((*dim).size() == 1)
     {
-        parallel_for_each([&](int device, cudaStream_t stream) {
-            AT_DISPATCH_V2(
-                out.scalar_type(), "mean_out", AT_WRAP([&] {
-                    int64_t device_offset, device_numel;
-                    std::tie(device_offset, device_numel) = chunk(in.numel(), device);
-                    const auto input = in.const_data_ptr<scalar_t>();
-                    auto output = out.data_ptr<scalar_t>();
-                    C10_CUDA_CHECK(cudaMemcpyAsync(output + device_offset, input + device_offset,
-                                                   device_numel * sizeof(scalar_t), cudaMemcpyDefault, stream));
-                }),
-                AT_EXPAND(AT_FLOATING_TYPES));
-        });
-    }
-    else if ((*dim).size() == 1 && ((*dim)[0] == -1 || (*dim)[0] == (in.dim() - 1)))
-    {
-        const auto layout = make_reduction_layout<2>(
-            in.sizes(), in.dim() - 1, std::array<IntArrayRef, 2>{ in.strides(), out.strides() });
+        const auto reduction_dim = c10::maybe_wrap_dim((*dim)[0], in.dim());
         AT_DISPATCH_V2(in.scalar_type(), "mean_out", AT_WRAP([&] {
-                           using accscalar_t = at::acc_type<scalar_t, true>;
-                           row_reduce<scalar_t, accscalar_t>(
-                               in.const_data_ptr<scalar_t>(), layout, RowSumTransform<scalar_t, accscalar_t>(),
-                               ::cuda::std::plus<accscalar_t>(), accscalar_t(0),
-                               RowMeanOutput<scalar_t, accscalar_t>{ out.data_ptr<scalar_t>(), in.size(-1) });
+                           reduce_sum_dimension<scalar_t>(
+                               in, reduction_dim, out,
+                               RowMeanOutput<scalar_t>{ out.data_ptr<scalar_t>(), in.size(reduction_dim) });
                        }),
                        AT_EXPAND(AT_FLOATING_TYPES));
     }
@@ -623,8 +643,6 @@ Tensor& mean_out(const Tensor& self, OptionalIntArrayRef dim, bool keepdim, std:
     {
         TORCH_CHECK(false, "Unsupported configuration in mean_out");
     }
-
-    C10_CUDA_CHECK(cudaSetDevice(device));
 
     return out;
 }

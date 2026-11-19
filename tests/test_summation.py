@@ -36,6 +36,113 @@ def test_cumsum(dgx_setup_teardown, dtype, numel):
     torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize(
+    "shape,dim,dtype",
+    [
+        ((3, 1025), -1, torch.float32),
+        ((2, 5, 7), 1, torch.float64),
+        ((2, 5, 7), -3, torch.float32),
+        ((3, 5), 0, torch.float16),
+        ((3, 5), 1, torch.bfloat16),
+        ((3, 5), 0, torch.int32),
+        ((3, 5), 1, torch.bool),
+    ],
+)
+def test_cumsum_multidimensional(dgx_setup_teardown, shape, dim, dtype):
+    samples = torch.randint(0, 2, shape).to(dtype)
+    actual = torch.cumsum(samples.to("dgx"), dim)
+    expected = torch.cumsum(samples, dim)
+
+    torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("dim", [0, 1, -1])
+def test_cumsum_noncontiguous_forward_backward(dgx_setup_teardown, dim):
+    base = torch.randn(3, 7, 10, dtype=torch.float64)
+    samples = base.transpose(0, 1)[..., 1::2].requires_grad_()
+    dgx_samples = base.to("dgx").transpose(0, 1)[..., 1::2].requires_grad_()
+    output = torch.empty(7, 3, 10, dtype=torch.float64, device="dgx")[..., ::2]
+
+    actual = torch.cumsum(dgx_samples, dim)
+    expected = torch.cumsum(samples, dim)
+    torch.cumsum(dgx_samples.detach(), dim, out=output)
+
+    torch.testing.assert_close(actual.cpu(), expected)
+    torch.testing.assert_close(output.cpu(), expected)
+
+    grad_output = torch.randn_like(samples)
+    expected.backward(grad_output)
+    actual.backward(grad_output.to("dgx"))
+    torch.testing.assert_close(dgx_samples.grad.cpu(), samples.grad)
+
+
+@pytest.mark.parametrize(
+    "shape,dim", [((), -1), ((0, 3), 0), ((2, 0, 3), 1), ((5,), -1)]
+)
+def test_cumsum_scalar_empty_and_negative_dim(dgx_setup_teardown, shape, dim):
+    samples = torch.randn(shape)
+    actual = torch.cumsum(samples.to("dgx"), dim)
+    expected = torch.cumsum(samples, dim)
+
+    torch.testing.assert_close(actual.cpu(), expected)
+
+
+def test_cumsum_output_dtype(dgx_setup_teardown):
+    samples = torch.arange(15, dtype=torch.int32).reshape(3, 5)
+    output = torch.empty(3, 5, dtype=torch.float64, device="dgx")
+
+    torch.cumsum(samples.to("dgx"), 1, out=output)
+
+    torch.testing.assert_close(
+        output.cpu(), torch.cumsum(samples, 1, dtype=torch.float64)
+    )
+
+
+@pytest.mark.parametrize(
+    "shape, dim, dtype",
+    [
+        ((), 0, torch.float32),
+        ((3, 0), -1, torch.float32),
+        ((513,), 0, torch.float64),
+        ((3, 513), -1, torch.float32),
+        ((513, 3), 0, torch.float16),
+        ((3, 17), -1, torch.bfloat16),
+        ((3, 17), 0, torch.int32),
+        ((17,), -1, torch.bool),
+        ((3, 17), 1, torch.complex64),
+    ],
+)
+def test_cumprod(dgx_setup_teardown, shape, dim, dtype):
+    source = torch.randint(-1, 2, shape).to(dtype)
+    if dtype.is_floating_point or dtype.is_complex:
+        source = source * 0.01 + 0.99
+    if len(shape) == 2:
+        source = source.t().contiguous().t()
+    tensor = source.to("dgx")
+    expected = source.cumprod(dim)
+    torch.testing.assert_close(tensor.cumprod(dim).cpu(), expected)
+    storage = torch.empty((*shape, 2), dtype=expected.dtype, device="dgx")
+    out = storage[..., 0]
+    torch.cumprod(tensor, dim, dtype=expected.dtype, out=out)
+    torch.testing.assert_close(out.cpu(), expected)
+    tensor = tensor.to(expected.dtype)
+    torch.cumprod(tensor, dim, out=tensor)
+    torch.testing.assert_close(tensor.cpu(), expected)
+
+
+def test_cumprod_backward(dgx_setup_teardown):
+    # No zeros, one zero, and multiple zeros exercise distinct backward paths.
+    source = torch.tensor(
+        [[0.9, 0.8, 0.7, 0.6], [0.9, 0.0, 0.7, 0.6], [0.0, 0.8, 0.0, 0.6]],
+        requires_grad=True,
+    )
+    tensor = source.detach().to("dgx").requires_grad_()
+    weights = torch.arange(12, dtype=source.dtype).reshape_as(source)
+    (source.cumprod(-1) * weights).sum().backward()
+    (tensor.cumprod(-1) * weights.to("dgx")).sum().backward()
+    torch.testing.assert_close(tensor.grad.cpu(), source.grad)
+
+
 @pytest.mark.parametrize("dims", [(0,), (1,), (0, 1), (1, 2), (-1, 0)])
 @pytest.mark.parametrize("keepdim", [False, True])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
@@ -115,6 +222,8 @@ def test_last_dim_sum_mean_seed_identity_signed_zero(dgx_setup_teardown):
         (torch.float32, (51,), None, False),
         (torch.float64, (51,), -1, True),
         (torch.float32, (23, 1), -1, True),
+        (torch.float64, (1, 17, 5), 0, False),
+        (torch.float32, (17, 1, 5), -2, True),
         (torch.float64, (101, 3), -1, False),
         (torch.float32, (3, 36), -1, False),
         (torch.float64, (8, 3, 16), -1, False),
@@ -124,6 +233,8 @@ def test_last_dim_sum_mean_seed_identity_signed_zero(dgx_setup_teardown):
         "full-float32",
         "full-explicit-keepdim-float64",
         "singleton-dim-float32",
+        "singleton-first-dim-float64",
+        "singleton-middle-dim-float32",
         "last-dim-many-rows-float64",
         "last-dim-long-rows-float32",
         "last-dim-rank3-float64",
@@ -295,6 +406,8 @@ def test_middle_dim_sum_tile_boundaries(
         (torch.sum, torch.float64, 1, (4, 17, 5), None),
         (torch.sum, torch.float64, 2, (4, 17, 5), None),
         (torch.mean, torch.float64, 2, (4, 17, 5), None),
+        (torch.mean, torch.float64, 0, (1, 17, 5), None),
+        (torch.mean, torch.float32, -2, (1, 17, 5), (2, 0, 1)),
         (torch.sum, torch.float32, [3], (1, 3, 2392, 1592), (0, 2, 3, 1)),
         (torch.mean, torch.float32, [3], (1, 3, 2392, 1592), (0, 2, 3, 1)),
         (torch.sum, torch.float64, -1, (2, 4, 3, 5, 7), (0, 2, 3, 4, 1)),
@@ -305,6 +418,8 @@ def test_middle_dim_sum_tile_boundaries(
         "sum-middle",
         "sum-last",
         "mean-last",
+        "mean-singleton-first",
+        "mean-singleton-middle-strided-input",
         "sum-last-rank4-strided-input",
         "mean-last-rank4-strided-input",
         "sum-last-rank5-strided-input",

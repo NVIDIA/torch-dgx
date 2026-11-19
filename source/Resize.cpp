@@ -5,9 +5,10 @@
 #include "Resize.h"
 
 #include "EventUtils.h"
-#include "TensorUtils.h"
+#include "PartitionUtils.h"
 
 #include <c10/cuda/CUDAStream.h>
+#include <c10/util/irange.h>
 
 #include <ATen/EmptyTensor.h>
 #include <ATen/native/Resize.h>
@@ -32,9 +33,6 @@ void resize_bytes_dgx_impl(StorageImpl* storage, size_t size_bytes)
     auto allocator = storage->allocator();
     TORCH_CHECK(allocator != nullptr, "Trying to resize storage without an allocator");
 
-    int current_device = cudaInvalidDeviceId;
-    C10_CUDA_CHECK(cudaGetDevice(&current_device));
-
     c10::Device device = storage->device();
 
     if (size_bytes == 0)
@@ -42,7 +40,6 @@ void resize_bytes_dgx_impl(StorageImpl* storage, size_t size_bytes)
         // The allocator orders release after pending work on all current streams.
         storage->set_data_ptr_noswap(at::DataPtr(nullptr, device));
         storage->set_nbytes(0);
-        C10_CUDA_CHECK(cudaSetDevice(current_device));
         return;
     }
 
@@ -56,14 +53,15 @@ void resize_bytes_dgx_impl(StorageImpl* storage, size_t size_bytes)
         const auto copy_nbytes = std::min(storage->nbytes(), size_bytes);
         for (const auto device_id : c10::irange(c10::cuda::device_count()))
         {
-            const auto [device_offset, device_nbytes] = chunk(copy_nbytes, device_id);
+            size_t device_offset, device_nbytes;
+            std::tie(device_offset, device_nbytes) = partition::range(copy_nbytes, device_id);
             if (device_nbytes)
             {
                 C10_CUDA_CHECK(cudaSetDevice(device_id));
                 auto stream = c10::cuda::getCurrentCUDAStream(device_id);
                 C10_CUDA_CHECK(cudaMemcpyAsync(static_cast<uint8_t*>(data.get()) + device_offset,
-                    static_cast<const uint8_t*>(storage->data()) + device_offset,
-                    device_nbytes, cudaMemcpyDefault, stream));
+                                               static_cast<const uint8_t*>(storage->data()) + device_offset,
+                                               device_nbytes, cudaMemcpyDefault, stream));
             }
         }
 
@@ -75,7 +73,6 @@ void resize_bytes_dgx_impl(StorageImpl* storage, size_t size_bytes)
     // DGXAllocator orders the old allocation's release after all per-device copies.
     storage->set_data_ptr_noswap(std::move(data));
     storage->set_nbytes(size_bytes);
-    C10_CUDA_CHECK(cudaSetDevice(current_device));
 }
 
 } // namespace

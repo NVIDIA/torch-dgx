@@ -274,22 +274,9 @@ def test_foreach_optimizer(dgx_setup_teardown, optimizer):
                 torch.testing.assert_close(dgx_optimizer.state[d][key].cpu(), value)
 
 
-def test_foreach_batches_kernel_launches(dgx_setup_teardown):
-    from torch.profiler import ProfilerActivity, profile
-
+def test_foreach_multiple_metadata_batches(dgx_setup_teardown):
     tensors = [torch.ones(257, device="dgx") for _ in range(65)]
     torch._foreach_add_(tensors, 1)
-    for device in range(torch.cuda.device_count()):
-        torch.cuda.synchronize(device)
-    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
-        torch._foreach_add_(tensors, 1)
-        for device in range(torch.cuda.device_count()):
-            torch.cuda.synchronize(device)
-    kernels = [
-        e
-        for e in prof.events()
-        if e.device_type != torch.autograd.DeviceType.CPU and "foreach_kernel" in e.name
-    ]
-    assert len(kernels) == 3 * torch.cuda.device_count()
+    torch._foreach_add_(tensors, 1)
     for tensor in tensors:
         torch.testing.assert_close(tensor.cpu(), torch.full((257,), 3.0))

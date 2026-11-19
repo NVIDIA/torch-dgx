@@ -7,11 +7,14 @@
 #include "DGXGenerator.h"
 #include "Resize.h"
 
-#include <ATen/cuda/PinnedMemoryAllocator.h>
+#include <c10/cuda/CUDAStream.h>
+
+#include <ATen/core/CachingHostAllocator.h>
 #include <ATen/detail/PrivateUse1HooksInterface.h>
 #include <ATen/native/CPUFallback.h>
 
 #include <torch/extension.h>
+#include <torch/version.h>
 
 #include <iostream>
 
@@ -31,7 +34,7 @@ struct DGXHooksInterface : public at::PrivateUse1HooksInterface
 
     at::Allocator* getPinnedMemoryAllocator() const override
     {
-        return at::cuda::getPinnedMemoryAllocator();
+        return at::getHostAllocator(at::kPrivateUse1);
     }
 
     const at::Generator& getDefaultGenerator(c10::DeviceIndex device_index) const override
@@ -52,6 +55,9 @@ struct DGXHooksInterface : public at::PrivateUse1HooksInterface
 
 int register_hook()
 {
+    // DGX uses CUDA-pinned host storage and CUDA streams. Share the allocator so
+    // both backends track pending DMA against the same pinned-memory cache.
+    at::setHostAllocator(at::kPrivateUse1, at::getHostAllocator(at::kCUDA));
     at::RegisterPrivateUse1HooksInterface(new DGXHooksInterface(DGXHooksArgs{}));
     return 0;
 }
@@ -75,6 +81,8 @@ TORCH_LIBRARY_IMPL(_, PrivateUse1, m)
     m.fallback(torch::CppFunction::makeFromBoxedFunction<&cpu_fallback>());
 }
 
+// PyTorch 2.10 and newer register the default AutogradPrivateUse1 fallback.
+#if TORCH_VERSION_MAJOR < 2 || (TORCH_VERSION_MAJOR == 2 && TORCH_VERSION_MINOR < 10)
 void autograd_fallback(const c10::OperatorHandle& op, c10::DispatchKeySet dispatch_keys, torch::jit::Stack* stack)
 {
     // PyTorch has separate builds, some of which don't include autograd.
@@ -93,6 +101,7 @@ TORCH_LIBRARY_IMPL(_, AutogradPrivateUse1, m)
 {
     m.fallback(torch::CppFunction::makeFromBoxedFunction<&autograd_fallback>());
 }
+#endif
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {

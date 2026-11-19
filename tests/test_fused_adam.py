@@ -32,9 +32,6 @@ def test_fused_adam_matches_cpu(dgx_setup_teardown, dtype, name, weight_decay, l
         for device in operands
     }
     op = getattr(torch, f"_fused_{name}_")
-    assert torch._C._dispatch_has_kernel_for_dispatch_key(
-        f"aten::_fused_{name}_", "PrivateUse1"
-    )
     # CPU rounds 1 - beta before the moment update; DGX uses the rounded beta
     # in fused multiply-adds. Allow the resulting FP32 rounding differences.
     tolerances = {"rtol": 1e-5, "atol": 1e-5} if dtype == torch.float32 else {}

@@ -5,9 +5,11 @@
 #pragma once
 
 #include "EventUtils.h"
-#include "TensorUtils.h"
+#include "PartitionUtils.h"
 
+#include <c10/cuda/CUDAException.h>
 #include <c10/cuda/CUDAStream.h>
+#include <c10/util/irange.h>
 
 #include <cuda/cmath>
 
@@ -44,12 +46,11 @@ __global__ __launch_bounds__(kNumThreads) void offset_lambda_kernel(int64_t nume
     }
 }
 
+// DGX operations and launch helpers leave the current CUDA device unspecified.
+// Callers must select their target device before subsequent CUDA work.
 template <typename Func, typename... Args>
 void parallel_for_each(Func func, Args... args)
 {
-    int current_device = cudaInvalidDeviceId;
-    C10_CUDA_CHECK(cudaGetDevice(&current_device));
-
     for (const auto device_id : c10::irange(c10::cuda::device_count()))
     {
         auto stream = c10::cuda::getCurrentCUDAStream(device_id);
@@ -58,24 +59,17 @@ void parallel_for_each(Func func, Args... args)
     }
 
     merge_streams();
-
-    C10_CUDA_CHECK(cudaSetDevice(current_device));
 }
 
 template <typename Func, typename... Args>
 void parallel_for_each_async(Func func, Args... args)
 {
-    int current_device = cudaInvalidDeviceId;
-    C10_CUDA_CHECK(cudaGetDevice(&current_device));
-
     for (const auto device_id : c10::irange(c10::cuda::device_count()))
     {
         auto stream = c10::cuda::getCurrentCUDAStream(device_id);
         C10_CUDA_CHECK(cudaSetDevice(device_id));
         func(device_id, stream, args...);
     }
-
-    C10_CUDA_CHECK(cudaSetDevice(current_device));
 }
 
 template <typename Func, typename... Args>
@@ -83,7 +77,7 @@ void mgpu_launch_func(int64_t alignment, int64_t numel, Func func, Args... args)
 {
     parallel_for_each([&](int device, cudaStream_t stream) {
         int64_t device_offset, device_numel;
-        std::tie(device_offset, device_numel) = aligned_chunk(alignment, numel, device);
+        std::tie(device_offset, device_numel) = partition::aligned_range(alignment, numel, device);
         const int64_t required_num_blocks = ::cuda::ceil_div(device_numel, kNumThreads);
         const unsigned int device_num_blocks =
             static_cast<unsigned int>(std::min<int64_t>(required_num_blocks, std::numeric_limits<int>::max()));

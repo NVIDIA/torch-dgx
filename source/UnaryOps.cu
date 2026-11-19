@@ -9,10 +9,14 @@
 
 #include <ATen/Dispatch_v2.h>
 #include <ATen/OpMathType.h>
+#include <ATen/TensorIterator.h>
 #include <ATen/native/Resize.h>
 #include <ATen/ops/empty.h>
+#include <ATen/ops/empty_like.h>
 
 #include <torch/library.h>
+
+#include <limits>
 
 namespace at::native
 {
@@ -170,6 +174,42 @@ struct LogitFunctor
     }
 };
 
+template <typename scalar_t>
+struct NanToNumFunctor
+{
+    scalar_t nan_replacement;
+    scalar_t posinf_replacement;
+    scalar_t neginf_replacement;
+
+    NanToNumFunctor(std::optional<double> nan, std::optional<double> posinf, std::optional<double> neginf)
+        : nan_replacement(nan.value_or(0.0)),
+          posinf_replacement(posinf.value_or(std::numeric_limits<scalar_t>::max())),
+          neginf_replacement(neginf.value_or(std::numeric_limits<scalar_t>::lowest()))
+    {
+    }
+
+    __device__ scalar_t replace_nonfinite(scalar_t value) const
+    {
+        const auto promoted = static_cast<at::opmath_type<scalar_t>>(value);
+        if (::cuda::std::isnan(promoted))
+            return nan_replacement;
+        if (::cuda::std::isinf(promoted))
+            return promoted > 0 ? posinf_replacement : neginf_replacement;
+        return value;
+    }
+
+    __device__ void operator()(int64_t index, const scalar_t* self, scalar_t* result) const
+    {
+        result[index] = replace_nonfinite(self[index]);
+    }
+
+    __device__ void operator()(int64_t index, const scalar_t* self, scalar_t* result, StridedOffsetCalculator<2> offsets) const
+    {
+        const auto tensor_offsets = offsets.get(index);
+        result[tensor_offsets[1]] = replace_nonfinite(self[tensor_offsets[0]]);
+    }
+};
+
 template <class T>
 struct NegFunctor
 {
@@ -221,6 +261,13 @@ struct SigmoidFunctor
         const T half = T(0.5);
         result[tid] = half * ::cuda::std::tanh(half * self[tid]) + half;
     }
+
+    __device__ void operator()(size_t tid, const T* self, T* result, StridedOffsetCalculator<2> offsets)
+    {
+        const auto tensor_offsets = offsets.get(tid);
+        const T half = T(0.5);
+        result[tensor_offsets[1]] = half * ::cuda::std::tanh(half * self[tensor_offsets[0]]) + half;
+    }
 };
 
 template <class T>
@@ -232,6 +279,14 @@ struct SigmoidBackwardFunctor
                                T* __restrict__ grad_input)
     {
         grad_input[tid] = grad_output[tid] * (T(1.) - output[tid]) * output[tid];
+    }
+
+    __device__ void operator()(
+        size_t tid, const T* grad_output, const T* output, T* grad_input, StridedOffsetCalculator<3> offsets)
+    {
+        const auto tensor_offsets = offsets.get(tid);
+        const T value = output[tensor_offsets[1]];
+        grad_input[tensor_offsets[2]] = grad_output[tensor_offsets[0]] * (T(1.) - value) * value;
     }
 };
 
@@ -444,6 +499,41 @@ Tensor logit(const Tensor& self, std::optional<double> eps)
     return result;
 }
 
+Tensor& nan_to_num_out(const Tensor& self,
+                       std::optional<double> nan,
+                       std::optional<double> posinf,
+                       std::optional<double> neginf,
+                       Tensor& result)
+{
+    TORCH_CHECK(self.scalar_type() == result.scalar_type(), "nan_to_num: expected out tensor to have dtype ",
+                self.scalar_type(), ", but got ", result.scalar_type());
+    TensorIterator iter;
+    iter.build_borrowing_unary_op(result, self);
+    if (iter.numel() == 0)
+        return result;
+    if (c10::isIntegralType(self.scalar_type(), true))
+        return result.copy_(self);
+
+    AT_DISPATCH_V2(
+        self.scalar_type(), "nan_to_num_out", AT_WRAP([&] {
+            const NanToNumFunctor<scalar_t> func(nan, posinf, neginf);
+            if (self.is_contiguous() && result.is_contiguous())
+            {
+                mgpu_launch_func(iter.numel(), func, self.const_data_ptr<scalar_t>(), result.data_ptr<scalar_t>());
+            }
+            else
+            {
+                const auto offsets = make_strided_offset_calculator<2>(
+                    self.sizes(), std::array<IntArrayRef, 2>{ self.strides(), result.strides() });
+                mgpu_launch_func(
+                    iter.numel(), func, self.const_data_ptr<scalar_t>(), result.data_ptr<scalar_t>(), offsets);
+            }
+        }),
+        AT_EXPAND(AT_FLOATING_TYPES), kHalf, kBFloat16);
+
+    return result;
+}
+
 Tensor& neg_out(const Tensor& self, Tensor& result)
 {
     at::native::resize_output(result, self.sizes());
@@ -510,12 +600,20 @@ Tensor& rsqrt_out(const Tensor& self, Tensor& result)
 
 Tensor& sigmoid_out(const Tensor& self, Tensor& result)
 {
-    TORCH_CHECK(self.is_contiguous());
-
-    at::native::resize_output(result, self.sizes());
+    auto iter = TensorIterator::unary_op(result, self);
     AT_DISPATCH_V2(self.scalar_type(), "sigmoid_out", AT_WRAP([&] {
-                       mgpu_launch_func(self.numel(), SigmoidFunctor<scalar_t>(), self.const_data_ptr<scalar_t>(),
-                                        result.data_ptr<scalar_t>());
+                       if (iter.is_contiguous())
+                       {
+                           // Matching dense permutations are contiguous in iterator order.
+                           mgpu_launch_func(iter.numel(), SigmoidFunctor<scalar_t>(), self.const_data_ptr<scalar_t>(),
+                                            result.data_ptr<scalar_t>());
+                       }
+                       else
+                       {
+                           const auto offsets = make_iterator_offset_calculator<2>(iter, { 1, 0 });
+                           mgpu_launch_func(iter.numel(), SigmoidFunctor<scalar_t>(), self.const_data_ptr<scalar_t>(),
+                                            result.data_ptr<scalar_t>(), offsets);
+                       }
                    }),
                    AT_EXPAND(AT_FLOATING_TYPES));
 
@@ -524,17 +622,33 @@ Tensor& sigmoid_out(const Tensor& self, Tensor& result)
 
 Tensor& sigmoid_backward_out(const Tensor& grad_output, const Tensor& output, Tensor& grad_input)
 {
-    TORCH_CHECK(grad_output.is_contiguous());
-    TORCH_CHECK(output.is_contiguous());
-
-    at::native::resize_output(grad_input, grad_output.sizes());
+    TORCH_CHECK(grad_output.sizes() == output.sizes(), "Expected grad_output and output to have the same shape");
+    auto iter = TensorIterator::binary_op(grad_input, grad_output, output);
     AT_DISPATCH_V2(grad_output.scalar_type(), "sigmoid_backward_out", AT_WRAP([&] {
-                       mgpu_launch_func(grad_output.numel(), SigmoidBackwardFunctor<scalar_t>(),
-                                        grad_output.const_data_ptr<scalar_t>(), output.const_data_ptr<scalar_t>(),
-                                        grad_input.data_ptr<scalar_t>());
+                       if (iter.is_contiguous())
+                       {
+                           mgpu_launch_func(iter.numel(), SigmoidBackwardFunctor<scalar_t>(),
+                                            grad_output.const_data_ptr<scalar_t>(), output.const_data_ptr<scalar_t>(),
+                                            grad_input.data_ptr<scalar_t>());
+                       }
+                       else
+                       {
+                           const auto offsets = make_iterator_offset_calculator<3>(iter, { 1, 2, 0 });
+                           mgpu_launch_func(iter.numel(), SigmoidBackwardFunctor<scalar_t>(),
+                                            grad_output.const_data_ptr<scalar_t>(), output.const_data_ptr<scalar_t>(),
+                                            grad_input.data_ptr<scalar_t>(), offsets);
+                       }
                    }),
                    AT_EXPAND(AT_FLOATING_TYPES));
 
+    return grad_input;
+}
+
+Tensor sigmoid_backward(const Tensor& grad_output, const Tensor& output)
+{
+    // Preserve the forward layout when the incoming gradient has different strides.
+    auto grad_input = at::empty_like(output, output.options(), at::MemoryFormat::Preserve);
+    sigmoid_backward_out(grad_output, output, grad_input);
     return grad_input;
 }
 
@@ -602,7 +716,8 @@ Tensor& sqrt_out(const Tensor& self, Tensor& result)
 
 Tensor& tanh_out(const Tensor& self, Tensor& out)
 {
-    auto iter = TensorIterator::unary_float_op(out, self);
+    TensorIterator iter;
+    iter.build_borrowing_unary_float_op(out, self);
     const Tensor input = iter.input(0).to(iter.common_dtype());
     const Tensor output = iter.output().scalar_type() == iter.common_dtype() ?
                               iter.output() :
@@ -623,7 +738,7 @@ Tensor& tanh_out(const Tensor& self, Tensor& out)
 Tensor& tanh_backward_out(const Tensor& grad_output, const Tensor& output, Tensor& grad_input)
 {
     TORCH_CHECK(grad_output.sizes() == output.sizes(), "Expected grad_output and output to have the same shape");
-    auto iter = TensorIterator::binary_op(grad_input, grad_output, output);
+    auto iter = TensorIterator::borrowing_binary_op(grad_input, grad_output, output);
     const Tensor grad = iter.input(0).to(iter.common_dtype());
     const Tensor values = iter.input(1).to(iter.common_dtype());
     const Tensor result = iter.output().scalar_type() == iter.common_dtype() ?
@@ -656,12 +771,14 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m)
     m.impl(TORCH_SELECTIVE_NAME("aten::log.out"), TORCH_FN(log_out));
     m.impl(TORCH_SELECTIVE_NAME("aten::log10.out"), TORCH_FN(log10_out));
     m.impl(TORCH_SELECTIVE_NAME("aten::logit"), TORCH_FN(logit));
+    m.impl(TORCH_SELECTIVE_NAME("aten::nan_to_num.out"), TORCH_FN(nan_to_num_out));
     m.impl(TORCH_SELECTIVE_NAME("aten::neg.out"), TORCH_FN(neg_out));
     m.impl(TORCH_SELECTIVE_NAME("aten::reciprocal.out"), TORCH_FN(reciprocal_out));
     m.impl(TORCH_SELECTIVE_NAME("aten::round.out"), TORCH_FN(round_out));
     m.impl(TORCH_SELECTIVE_NAME("aten::rsqrt.out"), TORCH_FN(rsqrt_out));
     m.impl(TORCH_SELECTIVE_NAME("aten::sgn.out"), TORCH_FN(sgn_out));
     m.impl(TORCH_SELECTIVE_NAME("aten::sigmoid.out"), TORCH_FN(sigmoid_out));
+    m.impl(TORCH_SELECTIVE_NAME("aten::sigmoid_backward"), TORCH_FN(sigmoid_backward));
     m.impl(TORCH_SELECTIVE_NAME("aten::sigmoid_backward.grad_input"), TORCH_FN(sigmoid_backward_out));
     m.impl(TORCH_SELECTIVE_NAME("aten::sign.out"), TORCH_FN(sign_out));
     m.impl(TORCH_SELECTIVE_NAME("aten::sin.out"), TORCH_FN(sin_out));

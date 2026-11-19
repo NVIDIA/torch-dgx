@@ -61,6 +61,30 @@ extern template StridedOffsetCalculator<3> make_strided_offset_calculator<3>(Int
 extern template StridedOffsetCalculator<4> make_strided_offset_calculator<4>(IntArrayRef,
                                                                              const std::array<IntArrayRef, 4>&);
 
+// TensorIterator orders dimensions fastest-first and stores byte strides. Reverse
+// that order for our row-major calculator, retaining its physical traversal order.
+template <size_t num_tensors>
+StridedOffsetCalculator<num_tensors> make_iterator_offset_calculator(const TensorIteratorBase& iter,
+                                                                     const std::array<int64_t, num_tensors>& operands,
+                                                                     bool byte_offsets = false)
+{
+    TORCH_CHECK(iter.ndim() <= kMaxTensorDimensions, "Too many TensorIterator dimensions");
+    StridedOffsetCalculator<num_tensors> calculator{};
+    calculator.num_dims = iter.ndim();
+    for (int64_t dim = 0; dim < iter.ndim(); ++dim)
+    {
+        const auto reversed_dim = iter.ndim() - 1 - dim;
+        calculator.sizes[reversed_dim] = iter.shape()[dim];
+        for (size_t tensor = 0; tensor < num_tensors; ++tensor)
+        {
+            const auto operand = operands[tensor];
+            calculator.strides[reversed_dim][tensor] =
+                iter.strides(operand)[dim] / (byte_offsets ? 1 : iter.element_size(operand));
+        }
+    }
+    return calculator;
+}
+
 template <typename input_t, typename output_t = input_t>
 struct StridedInputOp
 {

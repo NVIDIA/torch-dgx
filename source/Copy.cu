@@ -9,6 +9,7 @@
 
 #include <ATen/Dispatch_v2.h>
 #include <ATen/MemoryOverlap.h>
+#include <ATen/core/CachingHostAllocator.h>
 #include <ATen/core/Tensor.h>
 #include <ATen/ops/empty_like.h>
 
@@ -38,7 +39,7 @@ void for_each_destination_chunk(const Tensor& dst, Func func)
 {
     parallel_for_each([&](int device, cudaStream_t stream) {
         int64_t dst_begin, device_numel;
-        std::tie(dst_begin, device_numel) = chunk(dst.numel(), device);
+        std::tie(dst_begin, device_numel) = partition::range(dst.numel(), device);
         if (device_numel)
             func(stream, dst_begin, dst_begin + device_numel);
     });
@@ -277,10 +278,10 @@ void for_each_image_row_chunk(int64_t batch, int64_t height, int64_t width, Func
     const int64_t num_tile_rows = batch * tile_rows_per_image;
     const int64_t tiles_per_row = ::cuda::ceil_div(width, int64_t{ kInterleavedTilePixels });
     parallel_for_each([&](int device, cudaStream_t stream) {
-        // Match the image loss's ownership: split full-width 16-pixel tile rows across the batch,
+        // Match gsplat's imageTileRowChunk: balance full-width 16-pixel tile rows across the batch,
         // with every channel of each assigned row on the same device.
         int64_t tile_row_offset, tile_row_count;
-        std::tie(tile_row_offset, tile_row_count) = chunk(num_tile_rows, device);
+        std::tie(tile_row_offset, tile_row_count) = partition::range(num_tile_rows, device);
         if (!tile_row_count)
             return;
 
@@ -306,15 +307,14 @@ void launch_interleaved_to_planar_copy(const Tensor& self, const Tensor& dst)
     static_assert(channels == 3 || channels == 4);
     const int64_t height = self.size(2);
     const int64_t width = self.size(3);
-    for_each_image_row_chunk(
-        self.size(0), height, width,
-        [&](cudaStream_t stream, unsigned int num_blocks, int64_t first_row, int64_t num_rows) {
-            interleaved_to_planar_copy_kernel<SrcT, DstT, channels>
-                <<<num_blocks, channels * kInterleavedTilePixels, 0, stream>>>(
-                    self.const_data_ptr<SrcT>(), dst.data_ptr<DstT>(), height, width, self.stride(0), self.stride(2),
-                    self.stride(3), first_row, num_rows);
-            C10_CUDA_KERNEL_LAUNCH_CHECK();
-        });
+    for_each_image_row_chunk(self.size(0), height, width,
+                             [&](cudaStream_t stream, unsigned int num_blocks, int64_t first_row, int64_t num_rows) {
+                                 interleaved_to_planar_copy_kernel<SrcT, DstT, channels>
+                                     <<<num_blocks, channels * kInterleavedTilePixels, 0, stream>>>(
+                                         self.const_data_ptr<SrcT>(), dst.data_ptr<DstT>(), height, width,
+                                         self.stride(0), self.stride(2), self.stride(3), first_row, num_rows);
+                                 C10_CUDA_KERNEL_LAUNCH_CHECK();
+                             });
 }
 
 template <typename SrcT, typename DstT, int channels>
@@ -324,15 +324,15 @@ void launch_planar_to_interleaved_copy(const Tensor& self, const Tensor& dst)
     // Both tensors have logical NHWC dimensions; the source stores separate channel planes.
     const int64_t height = self.size(1);
     const int64_t width = self.size(2);
-    for_each_image_row_chunk(
-        self.size(0), height, width,
-        [&](cudaStream_t stream, unsigned int num_blocks, int64_t first_row, int64_t num_rows) {
-            planar_to_interleaved_copy_kernel<SrcT, DstT, channels>
-                <<<num_blocks, channels * kInterleavedTilePixels, 0, stream>>>(
-                    self.const_data_ptr<SrcT>(), dst.data_ptr<DstT>(), height, width, self.stride(0), self.stride(3),
-                    self.stride(1), dst.stride(0), dst.stride(1), dst.stride(2), first_row, num_rows);
-            C10_CUDA_KERNEL_LAUNCH_CHECK();
-        });
+    for_each_image_row_chunk(self.size(0), height, width,
+                             [&](cudaStream_t stream, unsigned int num_blocks, int64_t first_row, int64_t num_rows) {
+                                 planar_to_interleaved_copy_kernel<SrcT, DstT, channels>
+                                     <<<num_blocks, channels * kInterleavedTilePixels, 0, stream>>>(
+                                         self.const_data_ptr<SrcT>(), dst.data_ptr<DstT>(), height, width,
+                                         self.stride(0), self.stride(3), self.stride(1), dst.stride(0), dst.stride(1),
+                                         dst.stride(2), first_row, num_rows);
+                                 C10_CUDA_KERNEL_LAUNCH_CHECK();
+                             });
 }
 
 template <typename SrcT, typename DstT>
@@ -523,11 +523,16 @@ bool has_same_dense_layout(const Tensor& self, const Tensor& dst)
 }
 
 // Copies tensors with the same dtype and dense layout as one flat range per device.
-void dispatch_dense_copy(const Tensor& self, const Tensor& dst)
+void dispatch_dense_copy(const Tensor& self, const Tensor& dst, bool non_blocking)
 {
+    // CPU destinations remain blocking. Blocking uploads must also finish reading
+    // the source before the caller can mutate or release its host storage.
+    bool synchronize_host = dst.is_cpu() || (self.is_cpu() && !non_blocking);
     parallel_for_each_async([&](int device, cudaStream_t stream) {
         int64_t device_offset, device_numel;
-        std::tie(device_offset, device_numel) = chunk(self.numel(), device);
+        std::tie(device_offset, device_numel) = partition::range(self.numel(), device);
+        if (!device_numel)
+            return;
 
         AT_DISPATCH_V2(self.scalar_type(), "_copy_from", AT_WRAP([&] {
                            auto dst_ptr = dst.data_ptr<scalar_t>() + device_offset;
@@ -537,11 +542,20 @@ void dispatch_dense_copy(const Tensor& self, const Tensor& dst)
                        }),
                        AT_EXPAND(AT_ALL_TYPES_AND_COMPLEX), kHalf, kBFloat16, kBool,
                        AT_EXPAND(AT_BAREBONES_UNSIGNED_TYPES));
+
+        if (self.is_cpu() && non_blocking)
+        {
+            // Track every DMA reader so the pinned allocator cannot reuse the
+            // source early. The storage context also identifies offset views.
+            const bool tracked = at::getHostAllocator(at::kPrivateUse1)->record_event(
+                self.data_ptr(), self.storage().data_ptr().get_context(),
+                c10::cuda::getCurrentCUDAStream(device).unwrap());
+            // Pageable or externally owned host storage has no tracked lifetime.
+            synchronize_host |= !tracked;
+        }
     });
 
-    // In PyTorch, the copy operator is assumed to be blocking when the destination is the CPU. Thus, we need to
-    // synchronize the host and devices in order to ensure that the host data is valid when this operator returns.
-    if (dst.is_cpu())
+    if (synchronize_host)
     {
         for (const auto device_id : c10::irange(c10::cuda::device_count()))
         {
@@ -558,19 +572,19 @@ void dispatch_dense_copy(const Tensor& self, const Tensor& dst)
 // leave managed pages on the host and CPU reads migrate them from the GPUs; either way the next GPU access pays
 // the migration. Instead, transfer through flat copies, which leave pages on the GPUs, and cast on the GPUs.
 // empty_like preserves dense layouts and makes other layouts dense, so its results support flat copies.
-void host_to_device_cast_copy(const Tensor& self, const Tensor& dst)
+void host_to_device_cast_copy(const Tensor& self, const Tensor& dst, bool non_blocking)
 {
     auto src = self.resolve_conj();
     if (!src.is_non_overlapping_and_dense())
         src = src.contiguous();
     if (src.scalar_type() == dst.scalar_type() && !dst.is_conj() && has_same_dense_layout(src, dst))
     {
-        dispatch_dense_copy(src, dst);
+        dispatch_dense_copy(src, dst, non_blocking);
         return;
     }
 
     const auto staging = at::empty_like(src, src.options().device(dst.device()));
-    dispatch_dense_copy(src, staging);
+    dispatch_dense_copy(src, staging, non_blocking);
     dispatch_cast_copy(staging, dst, has_same_dense_layout(staging, dst), dst.is_conj());
 }
 
@@ -584,13 +598,13 @@ void device_to_host_cast_copy(const Tensor& self, const Tensor& dst)
     }
     if (!dst.is_conj() && has_same_dense_layout(src, dst))
     {
-        dispatch_dense_copy(src, dst);
+        dispatch_dense_copy(src, dst, false);
         return;
     }
 
     // The CPU applies the remaining layout change and conjugation to host memory only.
     const auto staging = at::empty_like(src, src.options().device(dst.device()));
-    dispatch_dense_copy(src, staging);
+    dispatch_dense_copy(src, staging, false);
     dst.copy_(staging);
 }
 
@@ -598,6 +612,7 @@ void device_to_host_cast_copy(const Tensor& self, const Tensor& dst)
 
 Tensor _copy_from_and_resize(const Tensor& self, const Tensor& dst)
 {
+    dst.resize_(self.sizes());
     return dst.copy_(self, false);
 }
 
@@ -618,7 +633,7 @@ Tensor _copy_from(const Tensor& self, const Tensor& dst, bool non_blocking)
 
     if (self.scalar_type() == dst.scalar_type() && same_dense_layout && !conjugate)
     {
-        dispatch_dense_copy(self, dst);
+        dispatch_dense_copy(self, dst, non_blocking);
     }
     else if (self.device().is_privateuseone() && dst.device().is_privateuseone())
     {
@@ -630,7 +645,7 @@ Tensor _copy_from(const Tensor& self, const Tensor& dst, bool non_blocking)
     }
     else if (self.device().is_cpu() && dst.device().is_privateuseone())
     {
-        host_to_device_cast_copy(self, dst);
+        host_to_device_cast_copy(self, dst, non_blocking);
     }
     else
     {

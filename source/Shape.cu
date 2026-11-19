@@ -6,6 +6,7 @@
 #include "StridedTensorUtils.cuh"
 
 #include <ATen/Dispatch_v2.h>
+#include <ATen/ops/empty.h>
 
 #include <torch/library.h>
 
@@ -17,6 +18,15 @@ namespace dgx
 
 namespace
 {
+
+template <typename scalar_t>
+struct FlipFunctor
+{
+    __device__ void operator()(int64_t index, const scalar_t* input, scalar_t* output, StridedOffsetCalculator<1> offsets) const
+    {
+        output[index] = input[offsets.get(index)[0]];
+    }
+};
 
 template <typename scalar_t, typename out_t = scalar_t>
 __global__ void cat_copy_kernel(
@@ -49,7 +59,7 @@ Tensor& cat_out(const ITensorListRef& tensors, int64_t dim, Tensor& result)
         int64_t device_offset = 0, device_count = 0;
         if (shard_dim >= 0)
         {
-            std::tie(device_offset, device_count) = chunk(result.size(shard_dim), device);
+            std::tie(device_offset, device_count) = partition::range(result.size(shard_dim), device);
             if (!device_count)
                 return;
         }
@@ -83,7 +93,7 @@ Tensor& cat_out(const ITensorListRef& tensors, int64_t dim, Tensor& result)
             }
             else
             {
-                std::tie(logical_offset, device_numel) = chunk(tensor.numel(), device);
+                std::tie(logical_offset, device_numel) = partition::range(tensor.numel(), device);
             }
             dim_offset += tensor.size(dim);
             if (!device_numel)
@@ -159,11 +169,42 @@ Tensor unfold(const Tensor& self, int64_t d, int64_t size, int64_t step)
     return self.as_strided(sizes, strides);
 }
 
+Tensor flip(const Tensor& self, IntArrayRef dims)
+{
+    auto strides = self.strides().vec();
+    std::vector<bool> flipped(std::max<int64_t>(self.dim(), 1), false);
+    int64_t offset = 0;
+    for (auto dim : dims)
+    {
+        dim = maybe_wrap_dim(dim, self.dim());
+        TORCH_CHECK(!flipped[dim], "dim ", dim, " appears multiple times in the list of dims");
+        flipped[dim] = true;
+        if (dim < self.dim())
+        {
+            offset += (self.size(dim) - 1) * strides[dim];
+            strides[dim] = -strides[dim];
+        }
+    }
+    auto result = at::empty(self.sizes(), self.options());
+    if (!self.numel())
+    {
+        return result;
+    }
+    const auto offsets = make_strided_offset_calculator<1>(self.sizes(), std::array<IntArrayRef, 1>{ strides });
+    AT_DISPATCH_V2(self.scalar_type(), "flip", AT_WRAP([&] {
+                       mgpu_launch_func(self.numel(), FlipFunctor<scalar_t>(), self.const_data_ptr<scalar_t>() + offset,
+                                        result.data_ptr<scalar_t>(), offsets);
+                   }),
+                   AT_EXPAND(AT_ALL_TYPES), kBool, kHalf, kBFloat16, kComplexHalf, kComplexFloat, kComplexDouble);
+    return result;
+}
+
 TORCH_LIBRARY_IMPL(aten, PrivateUse1, m)
 {
     m.impl(TORCH_SELECTIVE_NAME("aten::cat.out"), TORCH_FN(cat_out));
     m.impl(TORCH_SELECTIVE_NAME("aten::_reshape_alias"), TORCH_FN(_reshape_alias));
     m.impl(TORCH_SELECTIVE_NAME("aten::unfold"), TORCH_FN(unfold));
+    m.impl(TORCH_SELECTIVE_NAME("aten::flip"), TORCH_FN(flip));
 }
 
 } // namespace dgx

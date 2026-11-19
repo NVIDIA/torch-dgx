@@ -2,9 +2,8 @@
  * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  */
-#include "TensorUtils.h"
-
 #include <ATen/EmptyTensor.h>
+#include <ATen/core/Tensor.h>
 #include <ATen/ops/as_strided_native.h>
 #include <ATen/ops/view_as_complex_native.h>
 #include <ATen/ops/view_as_real_native.h>

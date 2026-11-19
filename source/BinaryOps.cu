@@ -6,6 +6,7 @@
 #include "StridedTensorUtils.cuh"
 
 #include <c10/util/TypeSafeSignMath.h>
+#include <c10/util/generic_math.h>
 
 #include <ATen/Dispatch_v2.h>
 #include <ATen/OpMathType.h>
@@ -15,6 +16,7 @@
 #include <torch/library.h>
 
 #include <cub/util_type.cuh>
+#include <cuda/std/cmath>
 #include <cuda/std/functional>
 
 #include <limits>
@@ -170,6 +172,29 @@ using AddFunctor = BinaryScaleOpFunctor<T, ::cuda::std::plus<void>>;
 template <typename T>
 using SubFunctor = BinaryScaleOpFunctor<T, ::cuda::std::minus<void>>;
 
+template <typename T>
+struct StridedAddCastFunctor
+{
+    const void* self;
+    const void* other;
+    void* out;
+    ScalarType self_type, other_type, out_type;
+    T alpha, self_scalar, other_scalar;
+    bool self_cpu_scalar, other_cpu_scalar;
+
+    __device__ void operator()(size_t tid, StridedOffsetCalculator<3> offsets) const
+    {
+        const auto tensor_offsets = offsets.get(tid);
+        const T lhs = self_cpu_scalar ?
+                          self_scalar :
+                          c10::fetch_and_cast<T>(self_type, static_cast<const char*>(self) + tensor_offsets[0]);
+        const T rhs = other_cpu_scalar ?
+                          other_scalar :
+                          c10::fetch_and_cast<T>(other_type, static_cast<const char*>(other) + tensor_offsets[1]);
+        c10::cast_and_store<T>(out_type, static_cast<char*>(out) + tensor_offsets[2], lhs + alpha * rhs);
+    }
+};
+
 template <typename T, typename OpT>
 struct BinaryOpFunctor
 {
@@ -289,6 +314,38 @@ template <typename T>
 using DivFunctor = BinaryOpFunctor<T, ::cuda::std::divides<void>>;
 
 template <typename T>
+struct FloorDivideOp
+{
+    using opmath_t = at::opmath_type<T>;
+
+    __device__ T operator()(opmath_t self, opmath_t other) const
+    {
+        if constexpr (std::is_same_v<T, uint8_t>)
+            return other == 0 ? std::numeric_limits<uint8_t>::max() : self / other;
+        else if constexpr (std::is_integral_v<T>)
+            return c10::div_floor_integer(self, other);
+        else
+            return static_cast<T>(c10::div_floor_floating(self, other));
+    }
+};
+
+template <typename T>
+using FloorDivideFunctor = BinaryOpFunctor<T, FloorDivideOp<T>>;
+
+template <typename T>
+struct Atan2Op
+{
+    __device__ T operator()(T self, T other) const
+    {
+        using opmath_t = at::opmath_type<T>;
+        return static_cast<T>(::cuda::std::atan2(static_cast<opmath_t>(self), static_cast<opmath_t>(other)));
+    }
+};
+
+template <typename T>
+using Atan2Functor = BinaryOpFunctor<T, Atan2Op<T>>;
+
+template <typename T>
 struct HypotOp
 {
     __device__ T operator()(T self, T other) const
@@ -358,6 +415,46 @@ struct PowFunctor
         out[tensor_offsets[1]] = ::cuda::std::pow(self[tensor_offsets[0]], exponent);
     }
 };
+
+// Operators choose the iterator's promotion rules and dispatch dtypes. CPU
+// scalars may use a wider type than tensor storage, as in floor division.
+template <typename scalar_t, typename cpu_scalar_t = scalar_t, typename Func>
+void strided_binary_out(TensorIterator& iter, Func func)
+{
+    const auto& out = iter.output();
+    const Tensor lhs = iter.input(0).to(iter.common_dtype()).expand(out.sizes());
+    const Tensor rhs = iter.input(1).to(iter.common_dtype()).expand(out.sizes());
+    const Tensor result = out.scalar_type() == iter.common_dtype() ?
+                              out :
+                              at::empty(out.sizes(), out.options().dtype(iter.common_dtype()));
+    const auto offsets = make_strided_offset_calculator<3>(
+        result.sizes(), std::array<IntArrayRef, 3>{ lhs.strides(), rhs.strides(), result.strides() });
+
+    if (iter.is_cpu_scalar(1) && iter.is_cpu_scalar(2))
+    {
+        mgpu_launch_func(iter.numel(), func, iter.scalar_value<cpu_scalar_t>(1), iter.scalar_value<cpu_scalar_t>(2),
+                         result.data_ptr<scalar_t>(), offsets);
+    }
+    else if (iter.is_cpu_scalar(1))
+    {
+        mgpu_launch_func(iter.numel(), func, iter.scalar_value<cpu_scalar_t>(1), rhs.const_data_ptr<scalar_t>(),
+                         result.data_ptr<scalar_t>(), offsets);
+    }
+    else if (iter.is_cpu_scalar(2))
+    {
+        mgpu_launch_func(iter.numel(), func, lhs.const_data_ptr<scalar_t>(), iter.scalar_value<cpu_scalar_t>(2),
+                         result.data_ptr<scalar_t>(), offsets);
+    }
+    else
+    {
+        mgpu_launch_func(iter.numel(), func, lhs.const_data_ptr<scalar_t>(), rhs.const_data_ptr<scalar_t>(),
+                         result.data_ptr<scalar_t>(), offsets);
+    }
+
+    if (!result.is_same(out))
+        out.copy_(result);
+    iter.cast_outputs();
+}
 
 } // namespace
 
@@ -438,8 +535,7 @@ Tensor& add_out(const Tensor& self, const Tensor& other, const Scalar& alpha, Te
                                          alpha.to<opmath_t>(), static_cast<opmath_t*>(iter.data_ptr(0)));
                     }
                 }
-                else if (self.sizes() == out.sizes() && other.sizes() == out.sizes() &&
-                         self.strides() == out.strides() && other.strides() == out.strides())
+                else if (iter.is_contiguous() && !iter.is_cpu_scalar(1) && !iter.is_cpu_scalar(2))
                 {
                     mgpu_launch_func(iter.numel(), func, static_cast<opmath_t*>(iter.data_ptr(1)),
                                      static_cast<opmath_t*>(iter.data_ptr(2)), alpha.to<opmath_t>(),
@@ -449,10 +545,8 @@ Tensor& add_out(const Tensor& self, const Tensor& other, const Scalar& alpha, Te
                 {
                     const auto self_expanded = iter.input(0).expand(out.sizes());
                     const auto other_expanded = iter.input(1).expand(out.sizes());
-                    // Use tensor strides in logical dimension order, not iter.strides().
-                    const auto offsets = make_strided_offset_calculator<3>(
-                        out.sizes(),
-                        std::array<IntArrayRef, 3>{ self_expanded.strides(), other_expanded.strides(), out.strides() });
+                    // Follow the iterator's storage order, including broadcast dimensions.
+                    const auto offsets = make_iterator_offset_calculator<3>(iter, { 1, 2, 0 });
                     if (iter.is_cpu_scalar(1) && iter.is_cpu_scalar(2))
                     {
                         mgpu_launch_func(iter.numel(), func, iter.scalar_value<opmath_t>(1),
@@ -488,7 +582,7 @@ Tensor& add_out(const Tensor& self, const Tensor& other, const Scalar& alpha, Te
 
                            AddFunctor<opmath_t> func;
 
-                           if (!iter.is_scalar(1) && iter.is_scalar(2))
+                           if (!iter.is_scalar(1) && iter.is_scalar(2) && all_contiguous)
                            {
                                if (iter.is_cpu_scalar(2))
                                {
@@ -506,8 +600,7 @@ Tensor& add_out(const Tensor& self, const Tensor& other, const Scalar& alpha, Te
                                                     c10::elementSize(iter.dtype(0)));
                                }
                            }
-                           else if (self.sizes() == out.sizes() && other.sizes() == out.sizes() &&
-                                    self.strides() == out.strides() && other.strides() == out.strides())
+                           else if (iter.is_contiguous() && !iter.is_cpu_scalar(1) && !iter.is_cpu_scalar(2))
                            {
                                mgpu_launch_func(iter.numel(), func, iter.data_ptr(1), iter.dtype(1),
                                                 c10::elementSize(iter.dtype(1)), iter.data_ptr(2), iter.dtype(2),
@@ -516,15 +609,22 @@ Tensor& add_out(const Tensor& self, const Tensor& other, const Scalar& alpha, Te
                            }
                            else
                            {
-                               auto self_expanded = iter.input(0).to(iter.common_dtype()).expand(out.sizes());
-                               auto other_expanded = iter.input(1).to(iter.common_dtype()).expand(out.sizes());
-                               // Preserve the original conversion buffers and logical traversal order.
-                               const auto offsets = make_strided_offset_calculator<3>(
-                                   out.sizes(), std::array<IntArrayRef, 3>{ self_expanded.strides(),
-                                                                            other_expanded.strides(), out.strides() });
-                               mgpu_launch_func(iter.numel(), func, self_expanded.const_data_ptr<opmath_t>(),
-                                                other_expanded.const_data_ptr<opmath_t>(), alpha.to<opmath_t>(),
-                                                out.data_ptr<opmath_t>(), offsets);
+                               // Read each storage dtype directly without materializing conversions.
+                               const auto offsets = make_iterator_offset_calculator<3>(iter, { 1, 2, 0 }, true);
+                               const StridedAddCastFunctor<opmath_t> cast_func{
+                                   iter.data_ptr(1),
+                                   iter.data_ptr(2),
+                                   iter.data_ptr(0),
+                                   iter.dtype(1),
+                                   iter.dtype(2),
+                                   iter.dtype(0),
+                                   alpha.to<opmath_t>(),
+                                   iter.is_cpu_scalar(1) ? iter.scalar_value<opmath_t>(1) : opmath_t(0),
+                                   iter.is_cpu_scalar(2) ? iter.scalar_value<opmath_t>(2) : opmath_t(0),
+                                   iter.is_cpu_scalar(1),
+                                   iter.is_cpu_scalar(2)
+                               };
+                               mgpu_launch_func(iter.numel(), cast_func, offsets);
                            }
                        }),
                        AT_EXPAND(AT_ALL_TYPES));
@@ -744,7 +844,7 @@ Tensor& polar_out(const Tensor& magnitude, const Tensor& angle, Tensor& out)
     TORCH_CHECK(out.scalar_type() == kComplexFloat, "Expected polar output to have dtype ComplexFloat");
     TORCH_CHECK(!out.is_conj(), "DGX polar does not support a conjugated output tensor");
 
-    auto iter = TensorIterator::binary_op(out, magnitude, angle);
+    auto iter = TensorIterator::borrowing_binary_op(out, magnitude, angle);
     const auto magnitude_expanded = magnitude.expand(out.sizes());
     const auto angle_expanded = angle.expand(out.sizes());
 
@@ -769,44 +869,65 @@ Tensor& div_out(const Tensor& self, const Tensor& other, Tensor& out)
     return binary_func_out<DivFunctor>(self, other, out);
 }
 
+Tensor& floor_divide_out(const Tensor& self, const Tensor& other, Tensor& out)
+{
+    auto iter = TensorIterator::borrowing_binary_op(out, self, other);
+    if (!out.defined())
+        out = iter.output();
+    AT_DISPATCH_V2(iter.common_dtype(), "floor_divide_out", AT_WRAP([&] {
+                       strided_binary_out<scalar_t, at::opmath_type<scalar_t>>(iter, FloorDivideFunctor<scalar_t>());
+                   }),
+                   AT_EXPAND(AT_ALL_TYPES), kHalf, kBFloat16);
+    return out;
+}
+
+Tensor floor_divide(const Tensor& self, const Tensor& other)
+{
+    Tensor out;
+    at::native::dgx::floor_divide_out(self, other, out);
+    return out;
+}
+
+Tensor& floor_divide_(Tensor& self, const Tensor& other)
+{
+    return at::native::dgx::floor_divide_out(self, other, self);
+}
+
+Tensor& atan2_out(const Tensor& self, const Tensor& other, Tensor& out)
+{
+    TensorIterator iter;
+    iter.build_borrowing_binary_float_op(out, self, other);
+    AT_DISPATCH_V2(iter.common_dtype(), "atan2_out",
+                   AT_WRAP([&] { strided_binary_out<scalar_t>(iter, Atan2Functor<scalar_t>()); }),
+                   AT_EXPAND(AT_FLOATING_TYPES), kHalf, kBFloat16);
+    return out;
+}
+
+template <typename T>
+struct MinimumOp
+{
+    __device__ T operator()(T left, T right) const
+    {
+        // Propagate NaNs and preserve the left operand's sign on zero ties.
+        return left != left || left <= right ? left : right;
+    }
+};
+
+Tensor& minimum_out(const Tensor& self, const Tensor& other, Tensor& out)
+{
+    auto iter = TensorIterator::borrowing_binary_op(out, self, other);
+    AT_DISPATCH_V2(iter.common_dtype(), "minimum_out",
+                   AT_WRAP([&] { strided_binary_out<scalar_t>(iter, BinaryOpFunctor<scalar_t, MinimumOp<scalar_t>>()); }),
+                   AT_EXPAND(AT_ALL_TYPES), kBool, kHalf, kBFloat16);
+    return out;
+}
+
 Tensor& hypot_out(const Tensor& self, const Tensor& other, Tensor& out)
 {
-    auto iter = TensorIterator::binary_op(out, self, other);
-    const Tensor lhs = iter.input(0).to(iter.common_dtype()).expand(out.sizes());
-    const Tensor rhs = iter.input(1).to(iter.common_dtype()).expand(out.sizes());
-    const Tensor result = iter.output().scalar_type() == iter.common_dtype() ?
-                              iter.output() :
-                              at::empty(out.sizes(), out.options().dtype(iter.common_dtype()));
-    const auto offsets = make_strided_offset_calculator<3>(
-        result.sizes(), std::array<IntArrayRef, 3>{ lhs.strides(), rhs.strides(), result.strides() });
-
-    AT_DISPATCH_V2(iter.common_dtype(), "hypot_out", AT_WRAP([&] {
-                       if (iter.is_cpu_scalar(1) && iter.is_cpu_scalar(2))
-                       {
-                           mgpu_launch_func(iter.numel(), HypotFunctor<scalar_t>(), iter.scalar_value<scalar_t>(1),
-                                            iter.scalar_value<scalar_t>(2), result.data_ptr<scalar_t>(), offsets);
-                       }
-                       else if (iter.is_cpu_scalar(1))
-                       {
-                           mgpu_launch_func(iter.numel(), HypotFunctor<scalar_t>(), iter.scalar_value<scalar_t>(1),
-                                            rhs.const_data_ptr<scalar_t>(), result.data_ptr<scalar_t>(), offsets);
-                       }
-                       else if (iter.is_cpu_scalar(2))
-                       {
-                           mgpu_launch_func(iter.numel(), HypotFunctor<scalar_t>(), lhs.const_data_ptr<scalar_t>(),
-                                            iter.scalar_value<scalar_t>(2), result.data_ptr<scalar_t>(), offsets);
-                       }
-                       else
-                       {
-                           mgpu_launch_func(iter.numel(), HypotFunctor<scalar_t>(), lhs.const_data_ptr<scalar_t>(),
-                                            rhs.const_data_ptr<scalar_t>(), result.data_ptr<scalar_t>(), offsets);
-                       }
-                   }),
+    auto iter = TensorIterator::borrowing_binary_op(out, self, other);
+    AT_DISPATCH_V2(iter.common_dtype(), "hypot_out",
+                   AT_WRAP([&] { strided_binary_out<scalar_t>(iter, HypotFunctor<scalar_t>()); }),
                    AT_EXPAND(AT_FLOATING_TYPES), kHalf, kBFloat16);
-
-    if (!result.is_same(iter.output()))
-        iter.output().copy_(result);
-    iter.cast_outputs();
     return out;
 }
 
@@ -857,7 +978,12 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m)
     m.impl(TORCH_SELECTIVE_NAME("aten::mul.out"), TORCH_FN(mul_out));
     m.impl(TORCH_SELECTIVE_NAME("aten::polar.out"), TORCH_FN(polar_out));
     m.impl(TORCH_SELECTIVE_NAME("aten::div.out"), TORCH_FN(div_out));
+    m.impl(TORCH_SELECTIVE_NAME("aten::floor_divide"), TORCH_FN(floor_divide));
+    m.impl(TORCH_SELECTIVE_NAME("aten::floor_divide.out"), TORCH_FN(floor_divide_out));
+    m.impl(TORCH_SELECTIVE_NAME("aten::floor_divide_.Tensor"), TORCH_FN(floor_divide_));
+    m.impl(TORCH_SELECTIVE_NAME("aten::atan2.out"), TORCH_FN(atan2_out));
     m.impl(TORCH_SELECTIVE_NAME("aten::hypot.out"), TORCH_FN(hypot_out));
+    m.impl(TORCH_SELECTIVE_NAME("aten::minimum.out"), TORCH_FN(minimum_out));
     m.impl(TORCH_SELECTIVE_NAME("aten::remainder.Tensor_out"), TORCH_FN(remainder_Tensor_out));
     m.impl(TORCH_SELECTIVE_NAME("aten::logical_and.out"), TORCH_FN(logical_and_out));
     m.impl(TORCH_SELECTIVE_NAME("aten::logical_or.out"), TORCH_FN(logical_or_out));

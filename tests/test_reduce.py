@@ -4,8 +4,9 @@ import torch
 import pytest
 
 
-def test_sum_dim0_dtype_conversion(dgx_setup_teardown):
-    samples = torch.randn(3, 65)
+@pytest.mark.parametrize("shape", [(3, 65), (3, 1, 65)])
+def test_sum_dim0_dtype_conversion(dgx_setup_teardown, shape):
+    samples = torch.randn(shape)
     dgx_samples = samples.to("dgx")
 
     actual = dgx_samples.sum(dim=0, dtype=torch.float64)
@@ -28,6 +29,37 @@ def test_sum_dim0_out_dtype(dgx_setup_teardown, cameras, count, dim):
     torch.testing.assert_close(output.cpu(), expected)
 
 
+@pytest.mark.parametrize("ndim", [2, 3])
+@pytest.mark.parametrize(
+    "rows,columns,dtype,strided",
+    [
+        (0, 3, torch.float32, False),
+        (1, 3, torch.float32, False),
+        (8193, 65, torch.float32, True),
+        (8193, 65, torch.float64, True),
+        (2101249, 3, torch.float32, False),
+    ],
+)
+def test_sum_dim0_row_partitions(
+    dgx_setup_teardown, ndim, rows, columns, dtype, strided
+):
+    # Uneven row shards, partial column tiles, and the capped multi-block reduction.
+    # Small integer values keep the expected sums exact despite reassociation.
+    if ndim == 2:
+        source = torch.randint(-3, 4, (rows, columns * (2 if strided else 1))).to(dtype)
+    else:
+        source = torch.randint(-3, 4, (rows, 1, columns * (2 if strided else 1))).to(
+            dtype
+        )
+    input = source.to("dgx")
+    if strided:
+        source = source[..., ::2]
+        input = input[..., ::2]
+    output = torch.empty((*source.shape[1:], 2), dtype=dtype, device="dgx")[..., 0]
+    assert torch.sum(input, dim=0, out=output) is output
+    torch.testing.assert_close(output.cpu(), source.sum(dim=0), rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64], ids=str)
 def test_min(dgx_setup_teardown, dtype):
     samples = torch.rand(73, dtype=dtype)
@@ -42,7 +74,90 @@ def test_max(dgx_setup_teardown, dtype):
     torch.testing.assert_close(result.to("cpu"), torch.max(samples))
 
 
-@pytest.mark.parametrize("op", ["any", "all", "equal"])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64], ids=str)
+@pytest.mark.parametrize("dim", [-1, 0, (0, 2), ()])
+@pytest.mark.parametrize("keepdim", [False, True])
+def test_amax(dgx_setup_teardown, dtype, dim, keepdim):
+    source = torch.randn(2, 3, 5, dtype=dtype)
+    source[0, 0, 0] = float("nan")
+    source[1, 0, :] = -float("inf")
+    input = source.to("dgx").transpose(0, 1)
+    source = source.transpose(0, 1)
+    expected = source.amax(dim=dim, keepdim=keepdim)
+
+    torch.testing.assert_close(
+        input.amax(dim=dim, keepdim=keepdim).cpu(), expected, equal_nan=True
+    )
+    out = torch.empty((*expected.shape, 2), dtype=dtype, device="dgx")[..., 0]
+    assert torch.amax(input, dim=dim, keepdim=keepdim, out=out) is out
+    torch.testing.assert_close(out.cpu(), expected, equal_nan=True)
+    assert torch.empty(0, 3, dtype=dtype, device="dgx").amax(dim=-1).shape == (0,)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64, torch.int32], ids=str)
+@pytest.mark.parametrize("values", [[-2, 3, 4], [0, -2, 5]])
+def test_prod(dgx_setup_teardown, dtype, values):
+    source = torch.tensor(values, dtype=dtype)
+    input = source.to("dgx")
+    torch.testing.assert_close(input.prod().cpu(), source.prod())
+    torch.testing.assert_close(
+        input.prod(dtype=torch.float64).cpu(), source.prod(dtype=torch.float64)
+    )
+
+
+@pytest.mark.parametrize("op", ["min", "max", "prod"])
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        torch.uint8,
+        torch.int8,
+        torch.int16,
+        torch.int32,
+        torch.int64,
+        torch.float32,
+        torch.float64,
+    ],
+    ids=str,
+)
+@pytest.mark.parametrize("strided", [False, True])
+def test_scalar_reduction_dtypes_and_layouts(dgx_setup_teardown, op, dtype, strided):
+    # Include an empty GPU shard, a single-block reduction, and a larger reduction.
+    for count in (1, 257, 65537):
+        source = torch.ones(count * 2 + 1, dtype=dtype)
+        source[1] = 2
+        source[-2] = 3
+        input = source.to("dgx")
+        source = source[1::2] if strided else source[1:]
+        input = input[1::2] if strided else input[1:]
+        kwargs = {"dtype": dtype} if op == "prod" else {}
+        expected = getattr(source, op)(**kwargs)
+        actual = getattr(input, op)(**kwargs)
+        torch.testing.assert_close(actual.cpu(), expected)
+
+
+@pytest.mark.parametrize(
+    "dtype",
+    [torch.bool, torch.float16, torch.bfloat16, torch.complex64, torch.complex128],
+    ids=str,
+)
+@pytest.mark.parametrize("strided", [False, True])
+def test_prod_accumulator_dtypes(dgx_setup_teardown, dtype, strided):
+    for count in (0, 1, 257, 65537):
+        source = torch.ones(count, 2, dtype=dtype)
+        if count:
+            source[0, :] = 1 if dtype == torch.bool else 2
+            if dtype.is_complex:
+                source[-1, :] = 1j
+        input = source.to("dgx")
+        if strided:
+            source = source[:, 0]
+            input = input[:, 0]
+        torch.testing.assert_close(
+            input.prod(dtype=dtype).cpu(), source.prod(dtype=dtype)
+        )
+
+
+@pytest.mark.parametrize("op", ["any", "all", "equal", "prod"])
 def test_empty_scalar_reduction(dgx_setup_teardown, op):
     samples = torch.empty(0, device="dgx")
     if op == "equal":
@@ -62,6 +177,18 @@ def test_minmax_out(dgx_setup_teardown, dtype, op):
             ref = op(samples, dim, keepdim)
             torch.testing.assert_close(result.values.to("cpu"), ref.values)
             assert torch.equal(result.indices.to("cpu"), ref.indices)
+
+
+@pytest.mark.parametrize(
+    "cols, dim, keepdim", [(4, -1, False), (4, 0, True), (65, 0, False)]
+)
+def test_max_bool(dgx_setup_teardown, cols, dim, keepdim):
+    samples = torch.zeros(3, cols, dtype=torch.bool)
+    samples[1:, 1:] = True
+    actual = samples.to("dgx").max(dim, keepdim)
+    expected = samples.max(dim, keepdim)
+    torch.testing.assert_close(actual.values.cpu(), expected.values)
+    torch.testing.assert_close(actual.indices.cpu(), expected.indices)
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64], ids=str)
@@ -455,9 +582,7 @@ def test_truth_last_dim_row_reduction_boundaries(dgx_setup_teardown):
 )
 @pytest.mark.parametrize("output_dtype", [torch.bool, torch.uint8], ids=str)
 @pytest.mark.parametrize("keepdim", [False, True], ids=["dropdim", "keepdim"])
-def test_any_dim_output_dtypes(
-    dgx_setup_teardown, input_dtype, output_dtype, keepdim
-):
+def test_any_dim_output_dtypes(dgx_setup_teardown, input_dtype, output_dtype, keepdim):
     # Exercise every contiguous row-reduction variant with an offset, strided
     # output. Untouched bytes catch stores that overwrite neighboring elements.
     widths = [0, 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 2049]

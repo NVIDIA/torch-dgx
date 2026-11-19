@@ -172,7 +172,7 @@ void var_mean_async(const Tensor& self, Tensor& variance, Tensor& mean, const Re
 {
     parallel_for_each([&](int device, cudaStream_t stream) {
         int64_t device_offset, device_numel;
-        std::tie(device_offset, device_numel) = chunk(variance.numel(), device);
+        std::tie(device_offset, device_numel) = partition::range(variance.numel(), device);
         if (device_numel == 0)
         {
             return;

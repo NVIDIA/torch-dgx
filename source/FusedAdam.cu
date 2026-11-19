@@ -142,17 +142,17 @@ __global__ void __launch_bounds__(256) fused_adam_kernel(int64_t numel,
 
 template <class T>
 __global__ void __launch_bounds__(256) fused_adamw_kernel(int64_t numel,
-                                                         T* __restrict__ param,
-                                                         const T* __restrict__ grad,
-                                                         T* __restrict__ exp_avg,
-                                                         T* __restrict__ exp_avg_sq,
-                                                         const T* __restrict__ step_size_ptr,
-                                                         const T* __restrict__ bias_correction2_sqrt_ptr,
-                                                         T beta1,
-                                                         T beta2,
-                                                         T eps,
-                                                         T lr,
-                                                         T weight_decay)
+                                                          T* __restrict__ param,
+                                                          const T* __restrict__ grad,
+                                                          T* __restrict__ exp_avg,
+                                                          T* __restrict__ exp_avg_sq,
+                                                          const T* __restrict__ step_size_ptr,
+                                                          const T* __restrict__ bias_correction2_sqrt_ptr,
+                                                          T beta1,
+                                                          T beta2,
+                                                          T eps,
+                                                          T lr,
+                                                          T weight_decay)
 {
     const T step_size = *step_size_ptr;
     const T bias_correction2_sqrt = *bias_correction2_sqrt_ptr;
@@ -190,20 +190,20 @@ __global__ void __launch_bounds__(256) fused_adamw_kernel(int64_t numel,
 } // namespace
 
 void _fused_adam_impl_(TensorList params,
-                  TensorList grads,
-                  TensorList exp_avgs,
-                  TensorList exp_avg_sqs,
-                  TensorList max_exp_avg_sqs,
-                  TensorList state_steps,
-                  double lr,
-                  double beta1,
-                  double beta2,
-                  double weight_decay,
-                  double eps,
-                  bool amsgrad,
-                  bool maximize,
-                  const ::std::optional<Tensor>& grad_scale,
-                  const ::std::optional<Tensor>& found_inf)
+                       TensorList grads,
+                       TensorList exp_avgs,
+                       TensorList exp_avg_sqs,
+                       TensorList max_exp_avg_sqs,
+                       TensorList state_steps,
+                       double lr,
+                       double beta1,
+                       double beta2,
+                       double weight_decay,
+                       double eps,
+                       bool amsgrad,
+                       bool maximize,
+                       const ::std::optional<Tensor>& grad_scale,
+                       const ::std::optional<Tensor>& found_inf)
 {
     TORCH_CHECK(!amsgrad);
     TORCH_CHECK(max_exp_avg_sqs.empty());
@@ -260,7 +260,7 @@ void _fused_adam_impl_(TensorList params,
 
     //                            int64_t device_offset, device_numel;
     //                            std::tie(device_offset, device_numel) =
-    //                                aligned_chunk(kAlignment, params[i].numel(), device_id);
+    //                                partition::aligned_range(kAlignment, params[i].numel(), device_id);
 
     //                            const unsigned int device_num_blocks =
     //                                ::cuda::ceil_div((device_numel + 3) / 4, kNumThreads);
@@ -317,7 +317,8 @@ void _fused_adam_impl_(TensorList params,
                     constexpr size_t kAlignment = 4;
 
                     int64_t device_offset, device_numel;
-                    std::tie(device_offset, device_numel) = aligned_chunk(kAlignment, params[i].numel(), device);
+                    std::tie(device_offset, device_numel) =
+                        partition::aligned_range(kAlignment, params[i].numel(), device);
                     if (!device_numel)
                         return;
 
@@ -356,20 +357,20 @@ void _fused_adam_impl_(TensorList params,
 }
 
 void _fused_adamw_impl_(TensorList params,
-                   TensorList grads,
-                   TensorList exp_avgs,
-                   TensorList exp_avg_sqs,
-                   TensorList max_exp_avg_sqs,
-                   TensorList state_steps,
-                   double lr,
-                   double beta1,
-                   double beta2,
-                   double weight_decay,
-                   double eps,
-                   bool amsgrad,
-                   bool maximize,
-                   const ::std::optional<Tensor>& grad_scale,
-                   const ::std::optional<Tensor>& found_inf)
+                        TensorList grads,
+                        TensorList exp_avgs,
+                        TensorList exp_avg_sqs,
+                        TensorList max_exp_avg_sqs,
+                        TensorList state_steps,
+                        double lr,
+                        double beta1,
+                        double beta2,
+                        double weight_decay,
+                        double eps,
+                        bool amsgrad,
+                        bool maximize,
+                        const ::std::optional<Tensor>& grad_scale,
+                        const ::std::optional<Tensor>& found_inf)
 {
     TORCH_CHECK(!amsgrad);
     TORCH_CHECK(max_exp_avg_sqs.empty());
@@ -413,7 +414,8 @@ void _fused_adamw_impl_(TensorList params,
                     constexpr size_t kAlignment = 4;
 
                     int64_t device_offset, device_numel;
-                    std::tie(device_offset, device_numel) = aligned_chunk(kAlignment, params[i].numel(), device);
+                    std::tie(device_offset, device_numel) =
+                        partition::aligned_range(kAlignment, params[i].numel(), device);
                     if (!device_numel)
                         return;
 

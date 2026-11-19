@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: BSD-3-Clause
  */
 #include "KernelLaunchUtils.cuh"
+#include "PartitionUtils.h"
 #include "RowReduction.cuh"
 
 #include <c10/cuda/CUDAStream.h>
@@ -10,6 +11,7 @@
 #include <ATen/Dispatch_v2.h>
 #include <ATen/MemoryOverlap.h>
 #include <ATen/OpMathType.h>
+#include <ATen/native/ReduceOpsUtils.h>
 #include <ATen/native/Resize.h>
 #include <ATen/ops/empty.h>
 
@@ -111,6 +113,18 @@ struct ArgIndexOutput
     }
 };
 
+template <typename scalar_t, typename acc_t>
+struct ArgValueOutput
+{
+    scalar_t* values;
+
+    template <typename Offsets>
+    __device__ void operator()(const Offsets& offsets, const ArgPair<acc_t>& aggregate) const
+    {
+        values[offsets[1]] = static_cast<scalar_t>(aggregate.value);
+    }
+};
+
 // Gathers one column of a 2-D tensor by walking the rows: element i maps to base[i * row_stride],
 // where `base` already points at the column's first row. `row_stride` is the tensor's stride(0) in
 // elements, so this respects transposed/sliced (non-contiguous) inputs.
@@ -139,7 +153,6 @@ __global__ void arg_min_dim0_merge_kernel(const scalar_t* partial_values,
                                           int64_t num_rows,
                                           int64_t num_cols)
 {
-    const int64_t chunk_size = ::cuda::ceil_div(num_rows, num_gpus);
     for (int64_t c = threadIdx.x + blockIdx.x * blockDim.x; c < num_cols; c += blockDim.x * gridDim.x)
     {
         scalar_t min = scalar_t{};
@@ -147,10 +160,8 @@ __global__ void arg_min_dim0_merge_kernel(const scalar_t* partial_values,
         bool found = false;
         for (int64_t device_id = 0; device_id < num_gpus; ++device_id)
         {
-            const int64_t chunk_offset = chunk_size * device_id;
-            const int64_t offset = chunk_offset < num_rows ? chunk_offset : num_rows;
-            const int64_t remaining = num_rows - offset;
-            const int64_t count = chunk_size < remaining ? chunk_size : remaining;
+            const int64_t offset = partition::offset(1, num_rows, num_gpus, device_id);
+            const int64_t count = partition::count(1, num_rows, num_gpus, device_id);
             if (count == 0)
                 continue;
             const scalar_t value = partial_values[device_id * num_cols + c];
@@ -177,7 +188,6 @@ __global__ void arg_max_dim0_merge_kernel(const scalar_t* partial_values,
                                           int64_t num_rows,
                                           int64_t num_cols)
 {
-    const int64_t chunk_size = ::cuda::ceil_div(num_rows, num_gpus);
     for (int64_t c = threadIdx.x + blockIdx.x * blockDim.x; c < num_cols; c += blockDim.x * gridDim.x)
     {
         scalar_t max = scalar_t{};
@@ -185,10 +195,8 @@ __global__ void arg_max_dim0_merge_kernel(const scalar_t* partial_values,
         bool found = false;
         for (int64_t device_id = 0; device_id < num_gpus; ++device_id)
         {
-            const int64_t chunk_offset = chunk_size * device_id;
-            const int64_t offset = chunk_offset < num_rows ? chunk_offset : num_rows;
-            const int64_t remaining = num_rows - offset;
-            const int64_t count = chunk_size < remaining ? chunk_size : remaining;
+            const int64_t offset = partition::offset(1, num_rows, num_gpus, device_id);
+            const int64_t count = partition::count(1, num_rows, num_gpus, device_id);
             if (count == 0)
                 continue;
             const scalar_t value = partial_values[device_id * num_cols + c];
@@ -230,7 +238,7 @@ void arg_min_dim0_async(const scalar_t* in,
 
         int64_t offset = 0;
         int64_t count = 0;
-        std::tie(offset, count) = chunk(num_rows, device_id);
+        std::tie(offset, count) = partition::range(num_rows, device_id);
         if (count > 0)
         {
             scalar_t* device_values = partial_values + device_id * num_cols;
@@ -317,7 +325,7 @@ void arg_max_dim0_async(const scalar_t* in,
 
         int64_t offset = 0;
         int64_t count = 0;
-        std::tie(offset, count) = chunk(num_rows, device_id);
+        std::tie(offset, count) = partition::range(num_rows, device_id);
         if (count > 0)
         {
             scalar_t* device_values = partial_values + device_id * num_cols;
@@ -493,9 +501,6 @@ void min_dim0_out(const Tensor& self, bool keepdim, Tensor& out_values, Tensor& 
         return;
     }
 
-    int device = cudaInvalidDeviceId;
-    C10_CUDA_CHECK(cudaGetDevice(&device));
-
     // With keepdim the outputs are [1, num_cols], so the column stride is stride(1); otherwise [num_cols].
     const int64_t out_values_stride = keepdim ? out_values.stride(1) : out_values.stride(0);
     const int64_t out_indices_stride = keepdim ? out_indices.stride(1) : out_indices.stride(0);
@@ -509,8 +514,6 @@ void min_dim0_out(const Tensor& self, bool keepdim, Tensor& out_values, Tensor& 
                                           partial_values.data_ptr<scalar_t>(), partial_indices.data_ptr<int64_t>());
                    }),
                    AT_EXPAND(AT_ALL_TYPES));
-
-    C10_CUDA_CHECK(cudaSetDevice(device));
 }
 
 void max_dim0_out(const Tensor& self, bool keepdim, Tensor& out_values, Tensor& out_indices)
@@ -532,12 +535,9 @@ void max_dim0_out(const Tensor& self, bool keepdim, Tensor& out_values, Tensor& 
                                      out_values.packed_accessor64<scalar_t, 1>(),
                                      out_indices.packed_accessor64<int64_t, 1>());
             }),
-            AT_EXPAND(AT_ALL_TYPES));
+            AT_EXPAND(AT_ALL_TYPES), kBool);
         return;
     }
-
-    int device = cudaInvalidDeviceId;
-    C10_CUDA_CHECK(cudaGetDevice(&device));
 
     // With keepdim the outputs are [1, num_cols], so the column stride is stride(1); otherwise [num_cols].
     const int64_t out_values_stride = keepdim ? out_values.stride(1) : out_values.stride(0);
@@ -551,9 +551,7 @@ void max_dim0_out(const Tensor& self, bool keepdim, Tensor& out_values, Tensor& 
                                           out_indices.data_ptr<int64_t>(), out_values_stride, out_indices_stride,
                                           partial_values.data_ptr<scalar_t>(), partial_indices.data_ptr<int64_t>());
                    }),
-                   AT_EXPAND(AT_ALL_TYPES));
-
-    C10_CUDA_CHECK(cudaSetDevice(device));
+                   AT_EXPAND(AT_ALL_TYPES), kBool);
 }
 
 // argmax and argmin share everything but the comparison, so they share their argument handling too.
@@ -647,7 +645,7 @@ std::tuple<Tensor&, Tensor&> max_out(const Tensor& self, int64_t dim, bool keepd
                                self.const_data_ptr<scalar_t>(), layout, ArgTransform<scalar_t>(), Op(), Op::identity(),
                                ArgOutput<scalar_t>{ max.data_ptr<scalar_t>(), max_values.data_ptr<int64_t>() });
                        }),
-                       AT_EXPAND(AT_ALL_TYPES));
+                       AT_EXPAND(AT_ALL_TYPES), kBool);
         return std::tie(max, max_values);
     }
 
@@ -698,6 +696,58 @@ std::tuple<Tensor&, Tensor&> min_out(const Tensor& self, int64_t dim, bool keepd
     return std::tie(min, min_values);
 }
 
+Tensor& amax_out(const Tensor& self, IntArrayRef dim, bool keepdim, Tensor& out)
+{
+    TORCH_CHECK(self.scalar_type() == out.scalar_type(), "amax expected self and out to have the same dtype");
+    TORCH_CHECK(self.device() == out.device(), "amax expected self and out to be on the same device");
+    const auto mask = make_dim_mask(dim, self.dim());
+    if (!self.numel())
+        zero_numel_check_dims(self, dim, "amax");
+
+    at::native::resize_output(out, shape_from_dim_mask(self, mask, keepdim));
+    assert_no_internal_overlap(out);
+    assert_no_overlap(out, self);
+
+    if (self.dim() == 0)
+    {
+        out.copy_(self);
+    }
+    else if (out.numel())
+    {
+        std::vector<int64_t> reduction_dims;
+        for (int64_t d = self.dim() - 1; d >= 0; --d)
+        {
+            if (mask[d])
+                reduction_dims.push_back(d);
+        }
+
+        AT_DISPATCH_V2(
+            self.scalar_type(), "amax_out", AT_WRAP([&] {
+                using acc_t = at::opmath_type<scalar_t>;
+                using Op = ArgReductionOp<acc_t, ::cuda::std::greater<acc_t>>;
+                Tensor input = self;
+                for (const auto i : c10::irange(reduction_dims.size()))
+                {
+                    const auto reduction_dim = reduction_dims[i];
+                    auto sizes = input.sizes().vec();
+                    sizes[reduction_dim] = 1;
+                    Tensor output = i + 1 == reduction_dims.size() ?
+                                        review_reduce_result(out, self.dim(), mask, keepdim) :
+                                        at::empty(sizes, self.options());
+                    const auto layout = make_reduction_layout<2>(
+                        input.sizes(), reduction_dim, std::array<IntArrayRef, 2>{ input.strides(), output.strides() });
+                    row_reduce<scalar_t, ArgPair<acc_t>>(input.const_data_ptr<scalar_t>(), layout,
+                                                         ArgTransform<scalar_t, acc_t>(), Op(), Op::identity(),
+                                                         ArgValueOutput<scalar_t, acc_t>{ output.data_ptr<scalar_t>() });
+                    input = output;
+                }
+            }),
+            AT_EXPAND(AT_ALL_TYPES), kHalf, kBFloat16, kBool);
+    }
+
+    return out;
+}
+
 Tensor& argmax_out(const Tensor& self, std::optional<int64_t> dim, bool keepdim, Tensor& out)
 {
     const auto reduction = prepare_arg_reduction(self, dim, keepdim, "argmax():", out);
@@ -742,6 +792,7 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m)
 {
     m.impl(TORCH_SELECTIVE_NAME("aten::max.dim_max"), TORCH_FN(max_out));
     m.impl(TORCH_SELECTIVE_NAME("aten::min.dim_min"), TORCH_FN(min_out));
+    m.impl(TORCH_SELECTIVE_NAME("aten::amax.out"), TORCH_FN(amax_out));
     m.impl(TORCH_SELECTIVE_NAME("aten::argmax.out"), TORCH_FN(argmax_out));
     m.impl(TORCH_SELECTIVE_NAME("aten::argmin.out"), TORCH_FN(argmin_out));
 }

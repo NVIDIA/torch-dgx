@@ -166,7 +166,7 @@ void launch_bincount(const Tensor& input, const Tensor* weights, Tensor& output)
             C10_CUDA_CHECK(cudaMemsetAsync(partial_histogram, 0, histogram_stride * sizeof(output_t), stream));
 
             int64_t input_offset, device_num_inputs;
-            std::tie(input_offset, device_num_inputs) = chunk(num_inputs, device);
+            std::tie(input_offset, device_num_inputs) = partition::range(num_inputs, device);
             const unsigned int num_blocks = ::cuda::ceil_div(device_num_inputs, kNumThreads);
             if (!num_blocks)
                 return;
@@ -188,7 +188,7 @@ void launch_bincount(const Tensor& input, const Tensor* weights, Tensor& output)
 
         parallel_for_each([&](int device, cudaStream_t stream) {
             int64_t bin_offset, device_num_bins;
-            std::tie(bin_offset, device_num_bins) = aligned_chunk(page_elements, num_bins, device);
+            std::tie(bin_offset, device_num_bins) = partition::aligned_range(page_elements, num_bins, device);
             const unsigned int num_blocks = ::cuda::ceil_div(device_num_bins, kNumThreads);
             if (!num_blocks)
                 return;
@@ -203,7 +203,7 @@ void launch_bincount(const Tensor& input, const Tensor* weights, Tensor& output)
     {
         parallel_for_each([&](int device, cudaStream_t stream) {
             int64_t first_bin, device_num_bins;
-            std::tie(first_bin, device_num_bins) = aligned_chunk(page_elements, num_bins, device);
+            std::tie(first_bin, device_num_bins) = partition::aligned_range(page_elements, num_bins, device);
             if (!device_num_bins)
                 return;
 

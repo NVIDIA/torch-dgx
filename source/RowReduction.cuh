@@ -231,7 +231,7 @@ void row_reduce(const input_t* input,
 {
     parallel_for_each([&](int device, cudaStream_t stream) {
         int64_t segment_offset, num_segments;
-        std::tie(segment_offset, num_segments) = chunk(layout.num_segments, device);
+        std::tie(segment_offset, num_segments) = partition::range(layout.num_segments, device);
         if (!num_segments)
         {
             return;

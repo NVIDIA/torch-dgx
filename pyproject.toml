@@ -9,7 +9,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "torch-dgx"
-version = "1.0.0"
+version = "1.1.0.dev8"
 description = "A multi-GPU DGX-oriented backend for PyTorch"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -71,14 +71,17 @@ sources = [
     "source/Fill.cu",
     "source/Foreach.cu",
     "source/FusedAdam.cu",
+    "source/GridSampler.cu",
     "source/IndexKernel.cu",
     "source/Lerp.cu",
     "source/Linear.cu",
     "source/LinearAlgebra.cu",
     "source/Loss.cu",
+    "source/Median.cu",
     "source/NLLLoss.cu",
     "source/Nonzero.cu",
     "source/Normalization.cu",
+    "source/Pooling.cu",
     "source/Random.cu",
     "source/RangeFactories.cu",
     "source/ReduceAll.cu",
@@ -97,7 +100,7 @@ sources = [
     "source/StridedTensorUtils.cu",
     "source/CumulativeSum.cu",
     "source/Sum.cu",
-    "source/TensorUtils.cpp",
+    "source/TopK.cu",
     "source/Upsampling.cu",
     "source/UnaryOps.cu",
 ]

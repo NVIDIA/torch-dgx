@@ -91,9 +91,6 @@ Tensor& any_all_out(const Tensor& self, Tensor& out)
     // kInt8 requires special casing that we don't support yet
     TORCH_CHECK(self.scalar_type() != kChar);
 
-    int current_device = cudaInvalidDeviceId;
-    C10_CUDA_CHECK(cudaGetDevice(&current_device));
-
     Tensor device_outs = at::empty({ c10::cuda::device_count() }, out.options());
     AT_DISPATCH_V2(self.scalar_type(), "any.all_out", AT_WRAP([&] {
                        auto device_outputs = device_outs.data_ptr<bool>();
@@ -113,8 +110,6 @@ Tensor& any_all_out(const Tensor& self, Tensor& out)
                    }),
                    kByte, kShort, kInt, kLong, kFloat, kDouble, kBool);
 
-    device_outs.reset();
-    C10_CUDA_CHECK(cudaSetDevice(current_device));
     return out;
 }
 

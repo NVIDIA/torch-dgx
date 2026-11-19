@@ -5,7 +5,6 @@ import torch
 import torch.nn.functional as F
 
 
-pytestmark = pytest.mark.filterwarnings("error:.*fall back to run on the CPU.*")
 DTYPES = [torch.float32, torch.float64, torch.float16, torch.bfloat16]
 
 

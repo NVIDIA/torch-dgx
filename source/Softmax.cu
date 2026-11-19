@@ -146,7 +146,7 @@ void launch_softmax_forward(int64_t rows, int64_t dim_size, const scalar_t* self
 {
     parallel_for_each([&](int device, cudaStream_t stream) {
         int64_t row_offset, row_count;
-        std::tie(row_offset, row_count) = chunk(rows, device);
+        std::tie(row_offset, row_count) = partition::range(rows, device);
         if (!row_count)
             return;
         softmax_forward_block_kernel<scalar_t, safe>
@@ -322,7 +322,8 @@ Tensor& _log_softmax_out(const Tensor& self, int64_t dim, bool half_to_float, Te
         make_reduction_layout<2>(input.sizes(), dim, std::array<IntArrayRef, 2>{ input.strides(), output.strides() });
     AT_DISPATCH_V2(input.scalar_type(), "log_softmax_out", AT_WRAP([&] {
                        parallel_for_each([&](int device, cudaStream_t stream) {
-                           const auto [offset, count] = chunk(layout.num_segments, device);
+                           size_t offset, count;
+                           std::tie(offset, count) = partition::range(layout.num_segments, device);
                            if (count)
                            {
                                log_softmax_forward_kernel<<<static_cast<unsigned int>(std::min<int64_t>(count, 65535)),
@@ -363,7 +364,8 @@ Tensor& _log_softmax_backward_data_out(
             AT_DISPATCH_V2(
                 input_dtype, "log_softmax_backward_input", AT_WRAP([&] {
                     parallel_for_each([&](int device, cudaStream_t stream) {
-                        const auto [offset, count] = chunk(layout.num_segments, device);
+                        size_t offset, count;
+                        std::tie(offset, count) = partition::range(layout.num_segments, device);
                         if (count)
                         {
                             log_softmax_backward_kernel<<<static_cast<unsigned int>(std::min<int64_t>(count, 65535)),
@@ -505,7 +507,7 @@ Tensor& _softmax_backward_data_out(
                                {
                                    parallel_for_each([&](int device, cudaStream_t stream) {
                                        int64_t row_offset, row_count;
-                                       std::tie(row_offset, row_count) = chunk(outer, device);
+                                       std::tie(row_offset, row_count) = partition::range(outer, device);
                                        if (row_count)
                                        {
                                            const auto num_blocks = static_cast<unsigned int>(row_count);

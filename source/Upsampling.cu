@@ -74,26 +74,26 @@ Tensor& upsample_nearest2d_out(const Tensor& self,
     const float height_scale = compute_scales_value<float>(scales_h, input_height, output_height);
     const float width_scale = compute_scales_value<float>(scales_w, input_width, output_width);
 
-    AT_DISPATCH_V2(self.scalar_type(), "upsample_nearest2d_out", AT_WRAP([&] {
-                       for (const auto device_id : c10::irange(c10::cuda::device_count()))
-                       {
-                           C10_CUDA_CHECK(cudaSetDevice(device_id));
-                           auto stream = c10::cuda::getCurrentCUDAStream(device_id);
+    AT_DISPATCH_V2(
+        self.scalar_type(), "upsample_nearest2d_out", AT_WRAP([&] {
+            for (const auto device_id : c10::irange(c10::cuda::device_count()))
+            {
+                C10_CUDA_CHECK(cudaSetDevice(device_id));
+                auto stream = c10::cuda::getCurrentCUDAStream(device_id);
 
-                           int64_t device_offset, device_numel;
-                           std::tie(device_offset, device_numel) =
-                               aligned_chunk(output_height * output_width,
-                                             num_batches * num_channels * output_height * output_width, device_id);
+                int64_t device_offset, device_numel;
+                std::tie(device_offset, device_numel) = partition::aligned_range(
+                    output_height * output_width, num_batches * num_channels * output_height * output_width, device_id);
 
-                           unsigned int num_blocks = ::cuda::ceil_div(device_numel, kNumThreads);
-                           upsample_nearest2d_kernel<<<num_blocks, kNumThreads, 0, stream>>>(
-                               device_numel, device_offset, self.const_data_ptr<scalar_t>(), out.data_ptr<scalar_t>(),
-                               num_batches * num_channels, input_height, input_width, output_height, output_width,
-                               height_scale, width_scale);
-                           C10_CUDA_KERNEL_LAUNCH_CHECK();
-                       }
-                   }),
-                   AT_EXPAND(AT_FLOATING_TYPES));
+                unsigned int num_blocks = ::cuda::ceil_div(device_numel, kNumThreads);
+                upsample_nearest2d_kernel<<<num_blocks, kNumThreads, 0, stream>>>(
+                    device_numel, device_offset, self.const_data_ptr<scalar_t>(), out.data_ptr<scalar_t>(),
+                    num_batches * num_channels, input_height, input_width, output_height, output_width, height_scale,
+                    width_scale);
+                C10_CUDA_KERNEL_LAUNCH_CHECK();
+            }
+        }),
+        AT_EXPAND(AT_FLOATING_TYPES));
 
     merge_streams();
 

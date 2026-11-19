@@ -54,6 +54,11 @@ not exceed `2**31 - 1` with PyTorch 2.10–2.13, or `2**63 - 1` with PyTorch
 2.14 and newer, which support 64-bit RNG indexing throughout both passes.
 Larger configurations use the math decomposition.
 
+DGX `topk` uses CUB `DeviceTopK` and requires building with CCCL 3.2 or newer
+(bundled with CUDA 13.2); older toolkits retain the CPU fallback for this operator.
+Short slices use batched CUB block sorting. Wider slices are distributed by row,
+with column splitting and candidate merging when there are few wide rows and a small `k`.
+
 The allocator and distributed kernels let the host queue allocations, operator
 execution, and frees asynchronously. Reading GPU results on the CPU, such as
 through `loss.item()`, forces synchronization. Missing operator implementations

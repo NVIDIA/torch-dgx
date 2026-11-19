@@ -115,6 +115,56 @@ def test_conv2d_all_padding_height_shard(dgx_setup_teardown):
     torch.testing.assert_close(output, reference.to("dgx"), rtol=1e-4, atol=1e-5)
 
 
+@pytest.mark.parametrize("batch", [1, 5])
+@pytest.mark.parametrize(
+    "dtype,memory_format",
+    [
+        (torch.float16, torch.contiguous_format),
+        (torch.bfloat16, torch.contiguous_format),
+        (torch.float16, torch.channels_last),
+        (torch.bfloat16, torch.channels_last),
+        (torch.float32, torch.channels_last),
+        (torch.float64, torch.channels_last),
+    ],
+    ids=[
+        "float16",
+        "bfloat16",
+        "float16-nhwc",
+        "bfloat16-nhwc",
+        "float32-nhwc",
+        "float64-nhwc",
+    ],
+)
+def test_conv2d_bias(dgx_setup_teardown, batch, dtype, memory_format):
+    source = torch.randn(batch, 3, 13, 17, dtype=dtype).contiguous(
+        memory_format=memory_format
+    )
+    weight = torch.randn(5, 3, 3, 3, dtype=dtype).contiguous(
+        memory_format=memory_format
+    )
+    bias_storage = torch.randn(10, dtype=dtype)
+    bias = bias_storage[1::2]
+    reference_dtype = torch.float64 if dtype == torch.float64 else torch.float32
+    reference = torch.nn.functional.conv2d(
+        source.to(reference_dtype), weight.to(reference_dtype), padding=1
+    )
+    reference = reference.to(dtype) + bias.reshape(1, -1, 1, 1)
+    x, w, b = source.to("dgx"), weight.to("dgx"), bias_storage.to("dgx")[1::2]
+    memory_format = torch.contiguous_format if dtype == torch.float64 else memory_format
+    tolerance = {
+        torch.float16: 1e-2,
+        torch.bfloat16: 5e-2,
+        torch.float32: 1e-4,
+        torch.float64: 1e-10,
+    }[dtype]
+    for _ in range(2):
+        output = torch.nn.functional.conv2d(x, w, b, padding=1)
+        assert output.is_contiguous(memory_format=memory_format)
+        torch.testing.assert_close(
+            output.cpu(), reference, rtol=tolerance, atol=tolerance
+        )
+
+
 @pytest.mark.parametrize("dtype", datatypes, ids=str)
 def test_upsampling_nearest2d(dgx_setup_teardown, dtype):
     module = torch.nn.UpsamplingNearest2d(scale_factor=2)
