@@ -9,7 +9,9 @@
 #include <ATen/ExpandUtils.h>
 #include <ATen/MemoryOverlap.h>
 #include <ATen/core/Formatting.h>
+#include <ATen/cuda/Atomic.cuh>
 #include <ATen/native/CPUFallback.h>
+#include <ATen/native/Resize.h>
 #include <ATen/ops/arange.h>
 #include <ATen/ops/cumsum.h>
 #include <ATen/ops/empty.h>
@@ -21,6 +23,10 @@
 
 #include <cub/cub.cuh>
 #include <cuda/atomic>
+
+#include <array>
+#include <cstdint>
+#include <vector>
 
 namespace at::native
 {
@@ -117,6 +123,31 @@ __global__ void index_out_kernel(PackedTensorAccessor64<const scalar_t, 3, Restr
         output[i + indices_offset + output_offset][j] = input[input_i][input_j][j];
     }
 }
+
+template <typename scalar_t>
+struct IndexFillFunctor
+{
+    __device__ void operator()(size_t tid,
+                               scalar_t* self,
+                               PackedTensorAccessor64<const int64_t, 1, RestrictPtrTraits> indices,
+                               scalar_t value,
+                               int64_t dim_size,
+                               int64_t dim_stride,
+                               int64_t inner,
+                               int64_t first_output,
+                               int64_t last_output,
+                               StridedOffsetCalculator<1> offsets)
+    {
+        auto index = indices[(tid / inner) % indices.size(0)];
+        CUDA_KERNEL_ASSERT(index >= -dim_size && index < dim_size && "index out of bounds");
+        if (index < 0)
+            index += dim_size;
+
+        const auto output_index = (tid / (indices.size(0) * inner) * dim_size + index) * inner + tid % inner;
+        if (output_index >= first_output && output_index < last_output)
+            self[offsets.get(tid)[0] + index * dim_stride] = value;
+    }
+};
 
 template <typename scalar_t, bool accumulate = false>
 struct IndexPutFunctor
@@ -215,6 +246,50 @@ private:
     }
 };
 
+template <typename scalar_t, typename index_t>
+struct IndexPutAccumulateRowsFunctor
+{
+    template <typename value_t>
+    __device__ void operator()(size_t tid,
+                               scalar_t* __restrict__ self,
+                               int64_t self_rows,
+                               int64_t row_size,
+                               const index_t* __restrict__ indices,
+                               int64_t first_output,
+                               int64_t last_output,
+                               value_t values)
+    {
+        auto index = static_cast<int64_t>(indices[tid / row_size]);
+        CUDA_KERNEL_ASSERT(index >= -self_rows && index < self_rows && "index out of bounds");
+        if (index < 0)
+        {
+            index += self_rows;
+        }
+
+        const auto output_index = index * row_size + tid % row_size;
+        if (output_index >= first_output && output_index < last_output)
+        {
+            gpuAtomicAdd(self + output_index, value_at(values, tid));
+        }
+    }
+
+private:
+    __device__ scalar_t value_at(scalar_t value, size_t)
+    {
+        return value;
+    }
+
+    __device__ scalar_t value_at(cub::FutureValue<const scalar_t> value, size_t)
+    {
+        return value;
+    }
+
+    __device__ scalar_t value_at(StridedInputOp<scalar_t> values, size_t tid)
+    {
+        return values(tid);
+    }
+};
+
 template <typename index_t>
 struct IndexPutLastPositionFunctor
 {
@@ -271,185 +346,102 @@ struct GatherFunctor
         const index_t index = indices[tid];
         out[tid] = self[i * self_dim_size * inner + index * inner + j];
     }
+
+    __device__ void operator()(size_t tid,
+                               const scalar_t* self,
+                               const index_t* indices,
+                               scalar_t* out,
+                               int64_t dim_size,
+                               int64_t dim_stride,
+                               StridedOffsetCalculator<3> offsets)
+    {
+        const auto tensor_offsets = offsets.get(tid);
+        const index_t index = indices[tensor_offsets[1]];
+        CUDA_KERNEL_ASSERT(index >= 0 && index < dim_size && "index out of bounds");
+        out[tensor_offsets[2]] = self[tensor_offsets[0] + index * dim_stride];
+    }
 };
 
-template <typename scalar_t, typename index_t>
-struct ScatterAddFunctor
+template <typename scalar_t>
+struct ScatterSourceUpdate
 {
-    __device__ void operator()(size_t tid,
-                               int64_t,
-                               PackedTensorAccessor64<const index_t, 1, RestrictPtrTraits> index,
-                               PackedTensorAccessor64<const scalar_t, 1, RestrictPtrTraits> source,
-                               int64_t first_output,
-                               int64_t last_output,
-                               PackedTensorAccessor64<scalar_t, 1, RestrictPtrTraits> out)
-    {
-        const auto output_index = index[tid];
-        CUDA_KERNEL_ASSERT(output_index >= 0 && output_index < out.size(0) && "index out of bounds");
-        if (output_index >= first_output && output_index < last_output)
-            atomicAdd(&out[output_index], source[tid]);
-    }
+    const scalar_t* source;
 
-    __device__ void operator()(size_t tid,
-                               int64_t dim,
-                               PackedTensorAccessor64<const index_t, 2, RestrictPtrTraits> index,
-                               PackedTensorAccessor64<const scalar_t, 2, RestrictPtrTraits> source,
-                               int64_t first_output,
-                               int64_t last_output,
-                               PackedTensorAccessor64<scalar_t, 2, RestrictPtrTraits> out)
+    __device__ void operator()(scalar_t* output, int64_t source_offset) const
     {
-        const auto tid_x = tid / index.size(1);
-        const auto tid_y = tid % index.size(1);
-        const auto output_index = index[tid_x][tid_y];
-        CUDA_KERNEL_ASSERT(output_index >= 0 && output_index < out.size(dim) && "index out of bounds");
-        const auto output_offset = dim == 0 ? output_index * out.size(1) + tid_y : tid_x * out.size(1) + output_index;
-        if (output_offset < first_output || output_offset >= last_output)
-            return;
-        atomicAdd(out.data() + output_offset, source[tid_x][tid_y]);
-    }
-
-    __device__ void operator()(size_t tid,
-                               int64_t dim,
-                               PackedTensorAccessor64<const index_t, 3, RestrictPtrTraits> index,
-                               PackedTensorAccessor64<const scalar_t, 3, RestrictPtrTraits> source,
-                               int64_t first_output,
-                               int64_t last_output,
-                               PackedTensorAccessor64<scalar_t, 3, RestrictPtrTraits> out)
-    {
-        const auto tid_x = tid / (index.size(1) * index.size(2));
-        const auto tid_y = tid / index.size(2) % index.size(1);
-        const auto tid_z = tid % index.size(2);
-        const auto output_index = index[tid_x][tid_y][tid_z];
-        CUDA_KERNEL_ASSERT(output_index >= 0 && output_index < out.size(dim) && "index out of bounds");
-        int64_t output_offset;
-        if (dim == 0)
-            output_offset = (output_index * out.size(1) + tid_y) * out.size(2) + tid_z;
-        else if (dim == 1)
-            output_offset = (tid_x * out.size(1) + output_index) * out.size(2) + tid_z;
-        else
-            output_offset = (tid_x * out.size(1) + tid_y) * out.size(2) + output_index;
-        if (output_offset < first_output || output_offset >= last_output)
-            return;
-        atomicAdd(out.data() + output_offset, source[tid_x][tid_y][tid_z]);
-    }
-
-    __device__ void operator()(size_t tid,
-                               int64_t dim,
-                               PackedTensorAccessor64<const index_t, 4, RestrictPtrTraits> index,
-                               PackedTensorAccessor64<const scalar_t, 4, RestrictPtrTraits> source,
-                               int64_t first_output,
-                               int64_t last_output,
-                               PackedTensorAccessor64<scalar_t, 4, RestrictPtrTraits> out)
-    {
-        const auto tid_0 = tid / (index.size(1) * index.size(2) * index.size(3));
-        const auto tid_1 = tid / (index.size(2) * index.size(3)) % index.size(1);
-        const auto tid_2 = tid / index.size(3) % index.size(2);
-        const auto tid_3 = tid % index.size(3);
-        const auto output_index = index[tid_0][tid_1][tid_2][tid_3];
-        CUDA_KERNEL_ASSERT(output_index >= 0 && output_index < out.size(dim) && "index out of bounds");
-        int64_t output_offset;
-        if (dim == 0)
-            output_offset = ((output_index * out.size(1) + tid_1) * out.size(2) + tid_2) * out.size(3) + tid_3;
-        else if (dim == 1)
-            output_offset = ((tid_0 * out.size(1) + output_index) * out.size(2) + tid_2) * out.size(3) + tid_3;
-        else if (dim == 2)
-            output_offset = ((tid_0 * out.size(1) + tid_1) * out.size(2) + output_index) * out.size(3) + tid_3;
-        else
-            output_offset = ((tid_0 * out.size(1) + tid_1) * out.size(2) + tid_2) * out.size(3) + output_index;
-        if (output_offset < first_output || output_offset >= last_output)
-            return;
-        atomicAdd(out.data() + output_offset, source[tid_0][tid_1][tid_2][tid_3]);
+        *output = source[source_offset];
     }
 };
 
-template <typename scalar_t, typename index_t>
-struct ScatterValueFunctor
+template <typename scalar_t>
+struct ScatterAddUpdate
 {
-    __device__ void operator()(size_t tid,
-                               int64_t,
-                               PackedTensorAccessor64<const index_t, 1, RestrictPtrTraits> index,
-                               scalar_t value,
-                               int64_t first_output,
-                               int64_t last_output,
-                               PackedTensorAccessor64<scalar_t, 1, RestrictPtrTraits> out)
-    {
-        const auto output_index = index[tid];
-        CUDA_KERNEL_ASSERT(output_index >= 0 && output_index < out.size(0) && "index out of bounds");
-        if (output_index >= first_output && output_index < last_output)
-            out[output_index] = value;
-    }
+    const scalar_t* source;
 
-    __device__ void operator()(size_t tid,
-                               int64_t dim,
-                               PackedTensorAccessor64<const index_t, 2, RestrictPtrTraits> index,
-                               scalar_t value,
-                               int64_t first_output,
-                               int64_t last_output,
-                               PackedTensorAccessor64<scalar_t, 2, RestrictPtrTraits> out)
+    __device__ void operator()(scalar_t* output, int64_t source_offset) const
     {
-        const auto tid_x = tid / index.size(1);
-        const auto tid_y = tid % index.size(1);
-        const auto output_index = index[tid_x][tid_y];
-        CUDA_KERNEL_ASSERT(output_index >= 0 && output_index < out.size(dim) && "index out of bounds");
-        const auto output_offset = dim == 0 ? output_index * out.size(1) + tid_y : tid_x * out.size(1) + output_index;
-        if (output_offset < first_output || output_offset >= last_output)
-            return;
-        out.data()[output_offset] = value;
-    }
-
-    __device__ void operator()(size_t tid,
-                               int64_t dim,
-                               PackedTensorAccessor64<const index_t, 3, RestrictPtrTraits> index,
-                               scalar_t value,
-                               int64_t first_output,
-                               int64_t last_output,
-                               PackedTensorAccessor64<scalar_t, 3, RestrictPtrTraits> out)
-    {
-        const auto tid_x = tid / (index.size(1) * index.size(2));
-        const auto tid_y = tid / index.size(2) % index.size(1);
-        const auto tid_z = tid % index.size(2);
-        const auto output_index = index[tid_x][tid_y][tid_z];
-        CUDA_KERNEL_ASSERT(output_index >= 0 && output_index < out.size(dim) && "index out of bounds");
-        int64_t output_offset;
-        if (dim == 0)
-            output_offset = (output_index * out.size(1) + tid_y) * out.size(2) + tid_z;
-        else if (dim == 1)
-            output_offset = (tid_x * out.size(1) + output_index) * out.size(2) + tid_z;
-        else
-            output_offset = (tid_x * out.size(1) + tid_y) * out.size(2) + output_index;
-        if (output_offset < first_output || output_offset >= last_output)
-            return;
-        out.data()[output_offset] = value;
-    }
-
-    __device__ void operator()(size_t tid,
-                               int64_t dim,
-                               PackedTensorAccessor64<const index_t, 4, RestrictPtrTraits> index,
-                               scalar_t value,
-                               int64_t first_output,
-                               int64_t last_output,
-                               PackedTensorAccessor64<scalar_t, 4, RestrictPtrTraits> out)
-    {
-        const auto tid_0 = tid / (index.size(1) * index.size(2) * index.size(3));
-        const auto tid_1 = tid / (index.size(2) * index.size(3)) % index.size(1);
-        const auto tid_2 = tid / index.size(3) % index.size(2);
-        const auto tid_3 = tid % index.size(3);
-        const auto output_index = index[tid_0][tid_1][tid_2][tid_3];
-        CUDA_KERNEL_ASSERT(output_index >= 0 && output_index < out.size(dim) && "index out of bounds");
-        int64_t output_offset;
-        if (dim == 0)
-            output_offset = ((output_index * out.size(1) + tid_1) * out.size(2) + tid_2) * out.size(3) + tid_3;
-        else if (dim == 1)
-            output_offset = ((tid_0 * out.size(1) + output_index) * out.size(2) + tid_2) * out.size(3) + tid_3;
-        else if (dim == 2)
-            output_offset = ((tid_0 * out.size(1) + tid_1) * out.size(2) + output_index) * out.size(3) + tid_3;
-        else
-            output_offset = ((tid_0 * out.size(1) + tid_1) * out.size(2) + tid_2) * out.size(3) + output_index;
-        if (output_offset < first_output || output_offset >= last_output)
-            return;
-        out.data()[output_offset] = value;
+        atomicAdd(output, source[source_offset]);
     }
 };
+
+template <typename scalar_t>
+struct ScatterValueUpdate
+{
+    scalar_t value;
+
+    __device__ void operator()(scalar_t* output, int64_t) const
+    {
+        *output = value;
+    }
+};
+
+template <typename scalar_t, typename UpdateOp>
+struct ScatterFunctor
+{
+    UpdateOp update;
+
+    __device__ void operator()(size_t tid,
+                               const int64_t* index,
+                               scalar_t* out,
+                               int64_t dim_size,
+                               int64_t dim_stride,
+                               int64_t first_output,
+                               int64_t last_output,
+                               StridedOffsetCalculator<3> offsets) const
+    {
+        const auto tensor_offsets = offsets.get(tid);
+        const auto output_index = index[tensor_offsets[1]];
+        CUDA_KERNEL_ASSERT(output_index >= 0 && output_index < dim_size && "index out of bounds");
+        const auto output_offset = tensor_offsets[2] + output_index * dim_stride;
+        if (output_offset >= first_output && output_offset < last_output)
+            update(out + output_offset, tensor_offsets[0]);
+    }
+};
+
+// Callers provide a contiguous output; scalar sources use zero strides.
+template <typename scalar_t, typename UpdateOp>
+void scatter_out_impl(const Tensor& index, const Tensor& out, int64_t dim, IntArrayRef source_strides, UpdateOp update)
+{
+    auto base_strides = out.strides().vec();
+    base_strides[dim] = 0;
+    const auto offsets = make_strided_offset_calculator<3>(
+        index.sizes(), std::array<IntArrayRef, 3>{ source_strides, index.strides(), base_strides });
+    // Give each output page one owning GPU, including when indices repeat,
+    // so ordinary device-scope atomics are sufficient for scatter-add.
+    parallel_for_each([&](int device, cudaStream_t stream) {
+        int64_t first_output, device_numel;
+        std::tie(first_output, device_numel) =
+            partition::aligned_range(kPageSize / sizeof(scalar_t), out.numel(), device);
+        if (!device_numel)
+            return;
+        const auto blocks = static_cast<unsigned int>(::cuda::ceil_div(index.numel(), kNumThreads));
+        lambda_kernel<<<blocks, kNumThreads, 0, stream>>>(index.numel(), ScatterFunctor<scalar_t, UpdateOp>{ update },
+                                                          index.const_data_ptr<int64_t>(), out.data_ptr<scalar_t>(),
+                                                          out.size(dim), out.stride(dim), first_output,
+                                                          first_output + device_numel, offsets);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+    });
+}
 
 template <typename scalar_t, typename index_t>
 struct IndexSelectFunctor
@@ -575,7 +567,7 @@ Tensor& index_out(const Tensor& self, const c10::List<::std::optional<Tensor>>& 
                             int64_t device_offset, device_count;
                             // Keep selected rows on the same Gaussian owners for parameters and moments.
                             // Page-aligning the index array shifts wide output rows by much more than a page.
-                            std::tie(device_offset, device_count) = chunk(index.sizes()[d], device);
+                            std::tie(device_offset, device_count) = partition::range(index.sizes()[d], device);
 
                             const unsigned int device_num_blocks =
                                 ::cuda::ceil_div(device_count * out.stride(0), kNumThreads);
@@ -662,7 +654,7 @@ Tensor& index_out(const Tensor& self, const c10::List<::std::optional<Tensor>>& 
                 }
             }
         }),
-        AT_EXPAND(AT_ALL_TYPES));
+        AT_EXPAND(AT_ALL_TYPES), kBool);
     return out;
 }
 
@@ -673,10 +665,7 @@ Tensor& index_put(
     TORCH_CHECK(indices.size() == 1 && indices[0].has_value(), "index_put only supports a single tensor index");
 
     auto index = indices[0].value().to(self.device());
-    TORCH_CHECK(!accumulate || index.scalar_type() == kBool,
-                "accumulate = true is only supported for boolean masks in index_put");
-    TORCH_CHECK(
-        !unsafe || index.scalar_type() == kBool, "unsafe = true is only supported for boolean masks in index_put");
+    const bool accumulate_integer_indices = accumulate && index.scalar_type() != kBool;
     bool is_scalar = (values.dim() == 0);
     const bool is_cpu_scalar = is_scalar && values.device().is_cpu();
 
@@ -689,7 +678,7 @@ Tensor& index_put(
     at::assert_no_overlap(self, index);
     at::assert_no_overlap(self, values);
 
-    const bool use_elementwise_mask = index.sizes() == self.sizes() && is_scalar;
+    const bool use_elementwise_mask = index.scalar_type() == kBool && index.sizes() == self.sizes() && is_scalar;
     int64_t indexed_dims = 1;
     if (!use_elementwise_mask && index.scalar_type() == kBool)
     {
@@ -729,7 +718,7 @@ Tensor& index_put(
                                          index.const_data_ptr<bool>(), values.const_data_ptr<scalar_t>());
                 }
             }),
-            AT_EXPAND(AT_ALL_TYPES));
+            AT_EXPAND(AT_ALL_TYPES), kBool);
     }
     else if (self.dim() >= 1 && index.dim() == 1 && (index.scalar_type() == kInt || index.scalar_type() == kLong))
     {
@@ -747,6 +736,59 @@ Tensor& index_put(
         if (!index.numel() || !row_size)
             return self;
 
+        if (accumulate_integer_indices)
+        {
+            AT_DISPATCH_V2(
+                self.scalar_type(), "index_put_accumulate", AT_WRAP([&] {
+                    AT_DISPATCH_INDEX_TYPES(index.scalar_type(), "index_put_accumulate", [&]() {
+                        auto launch = [&](auto values_accessor) {
+                            parallel_for_each([&](int device, cudaStream_t stream) {
+                                // Subword atomics update a full 32-bit word. Keep that word on one GPU.
+                                constexpr int64_t kAlignment =
+                                    std::max<int64_t>(1, sizeof(unsigned int) / sizeof(scalar_t));
+                                const int64_t alignment_offset =
+                                    (reinterpret_cast<std::uintptr_t>(self.data_ptr<scalar_t>()) % sizeof(unsigned int)) /
+                                    sizeof(scalar_t);
+                                const auto [offset, count] =
+                                    partition::aligned_range(kAlignment, self.numel() + alignment_offset, device);
+                                const auto first = std::max<int64_t>(0, static_cast<int64_t>(offset) - alignment_offset);
+                                const auto last =
+                                    std::max<int64_t>(0, static_cast<int64_t>(offset + count) - alignment_offset);
+                                if (first == last)
+                                {
+                                    return;
+                                }
+
+                                const auto numel = index.numel() * row_size;
+                                const auto num_blocks = static_cast<unsigned int>(
+                                    std::min<int64_t>(::cuda::ceil_div(numel, kNumThreads), 65535));
+                                offset_lambda_kernel<<<num_blocks, kNumThreads, 0, stream>>>(
+                                    numel, 0, IndexPutAccumulateRowsFunctor<scalar_t, index_t>(),
+                                    self.data_ptr<scalar_t>(), self_rows, row_size, index.const_data_ptr<index_t>(),
+                                    first, last, values_accessor);
+                                C10_CUDA_KERNEL_LAUNCH_CHECK();
+                            });
+                        };
+
+                        if (is_cpu_scalar)
+                        {
+                            launch(values.item<scalar_t>());
+                        }
+                        else if (is_scalar)
+                        {
+                            launch(cub::FutureValue<const scalar_t>(values.const_data_ptr<scalar_t>()));
+                        }
+                        else
+                        {
+                            const auto offsets = make_strided_offset_calculator<1>(values.sizes(), { values.strides() });
+                            launch(StridedInputOp<scalar_t>{ values.const_data_ptr<scalar_t>(), offsets });
+                        }
+                    });
+                }),
+                AT_EXPAND(AT_ALL_TYPES), kBool);
+            return self;
+        }
+
         // Balance indexed rows across devices while keeping each row on one
         // device. Page-size alignment leaves the other devices idle for most
         // small and medium scatter operations.
@@ -759,7 +801,8 @@ Tensor& index_put(
                     constexpr int64_t position_page_elements = kPageSize / sizeof(int64_t);
                     parallel_for_each([&](int device, cudaStream_t stream) {
                         int64_t first_row, device_num_rows;
-                        std::tie(first_row, device_num_rows) = aligned_chunk(position_page_elements, self_rows, device);
+                        std::tie(first_row, device_num_rows) =
+                            partition::aligned_range(position_page_elements, self_rows, device);
                         if (!device_num_rows)
                             return;
 
@@ -818,28 +861,73 @@ Tensor& index_put(
                     {
                         const auto value_offsets =
                             make_strided_offset_calculator<1>(values.sizes(), { values.strides() });
-                        const StridedInputOp<scalar_t> values_accessor{ values.const_data_ptr<scalar_t>(),
-                                                                       value_offsets };
+                        const StridedInputOp<scalar_t> values_accessor{ values.const_data_ptr<scalar_t>(), value_offsets };
                         if (accumulate)
-                            mgpu_launch_func(
-                                row_alignment, index.numel() * row_size, IndexPutRowsFunctor<scalar_t, index_t, true>(),
-                                self.data_ptr<scalar_t>(), self_rows, row_size, index.const_data_ptr<index_t>(),
-                                last_positions.const_data_ptr<int64_t>(), values_accessor);
+                            mgpu_launch_func(row_alignment, index.numel() * row_size,
+                                             IndexPutRowsFunctor<scalar_t, index_t, true>(), self.data_ptr<scalar_t>(),
+                                             self_rows, row_size, index.const_data_ptr<index_t>(),
+                                             last_positions.const_data_ptr<int64_t>(), values_accessor);
                         else
-                            mgpu_launch_func(
-                                row_alignment, index.numel() * row_size, IndexPutRowsFunctor<scalar_t, index_t>(),
-                                self.data_ptr<scalar_t>(), self_rows, row_size, index.const_data_ptr<index_t>(),
-                                last_positions.const_data_ptr<int64_t>(), values_accessor);
+                            mgpu_launch_func(row_alignment, index.numel() * row_size,
+                                             IndexPutRowsFunctor<scalar_t, index_t>(), self.data_ptr<scalar_t>(),
+                                             self_rows, row_size, index.const_data_ptr<index_t>(),
+                                             last_positions.const_data_ptr<int64_t>(), values_accessor);
                     }
                 });
             }),
-            AT_EXPAND(AT_ALL_TYPES));
+            AT_EXPAND(AT_ALL_TYPES), kBool);
     }
     else
     {
         TORCH_CHECK(false, "Unsupported configuration for index_put");
     }
 
+    return self;
+}
+
+Tensor& index_fill_(Tensor& self, int64_t dim, const Tensor& index, const Scalar& value)
+{
+    TORCH_CHECK(index.scalar_type() == kLong, "index_fill_ expected index to have dtype int64");
+    TORCH_CHECK(index.dim() <= 1, "index_fill_ expected a scalar or vector index");
+    TORCH_CHECK(index.device().is_cpu() || index.device() == self.device(),
+                "index_fill_ expected index to be on CPU or the same device as self");
+    dim = c10::maybe_wrap_dim(dim, self.dim());
+    assert_no_internal_overlap(self);
+    assert_no_overlap(self, index);
+    if (!self.numel() || !index.numel())
+        return self;
+
+    const Tensor target = self.dim() == 0 ? self.view({ 1 }) : self;
+    auto sizes = target.sizes().vec();
+    auto strides = target.strides().vec();
+    sizes[dim] = index.numel();
+    strides[dim] = 0;
+    const auto offsets = make_strided_offset_calculator<1>(sizes, { strides });
+    int64_t inner = 1;
+    for (int64_t d = dim + 1; d < target.dim(); ++d)
+        inner *= target.size(d);
+    const int64_t count = target.numel() / target.size(dim) * index.numel();
+
+    AT_DISPATCH_V2(
+        self.scalar_type(), "index_fill_", AT_WRAP([&] {
+            constexpr size_t kAlignment = kPageSize / sizeof(scalar_t);
+            const Tensor indices = index.to(self.device()).reshape({ -1 });
+            const auto scalar_value = value.to<scalar_t>();
+            // Each destination belongs to one GPU, including when indices repeat.
+            parallel_for_each([&](int device, cudaStream_t stream) {
+                int64_t first_output, device_numel;
+                std::tie(first_output, device_numel) = partition::aligned_range(kAlignment, target.numel(), device);
+                if (!device_numel)
+                    return;
+                const auto num_blocks = static_cast<unsigned int>(::cuda::ceil_div(count, kNumThreads));
+                offset_lambda_kernel<<<num_blocks, kNumThreads, 0, stream>>>(
+                    count, 0, IndexFillFunctor<scalar_t>(), self.data_ptr<scalar_t>(),
+                    indices.packed_accessor64<const int64_t, 1, RestrictPtrTraits>(), scalar_value, target.size(dim),
+                    target.stride(dim), inner, first_output, first_output + device_numel, offsets);
+                C10_CUDA_KERNEL_LAUNCH_CHECK();
+            });
+        }),
+        AT_EXPAND(AT_ALL_TYPES), kHalf, kBFloat16, kBool);
     return self;
 }
 
@@ -930,7 +1018,7 @@ Tensor masked_select(const Tensor& self, const Tensor& mask)
 
     parallel_for_each_async([&](int device, cudaStream_t stream) {
         int64_t device_offset, device_numel;
-        std::tie(device_offset, device_numel) = chunk(flags.numel(), device);
+        std::tie(device_offset, device_numel) = partition::range(flags.numel(), device);
 
         const auto device_flags = flags.const_data_ptr<bool>() + device_offset;
 
@@ -952,9 +1040,6 @@ Tensor masked_select(const Tensor& self, const Tensor& mask)
     }
     Tensor out = at::empty({ out_size }, self.options());
 
-    int current_device = cudaInvalidDeviceId;
-    C10_CUDA_CHECK(cudaGetDevice(&current_device));
-
     int64_t out_offset = 0;
     for (const auto device_id : c10::irange(c10::cuda::device_count()))
     {
@@ -967,7 +1052,7 @@ Tensor masked_select(const Tensor& self, const Tensor& mask)
                            auto output = out.data_ptr<scalar_t>();
 
                            int64_t device_offset, device_numel;
-                           std::tie(device_offset, device_numel) = chunk(input.numel(), device_id);
+                           std::tie(device_offset, device_numel) = partition::range(input.numel(), device_id);
 
                            auto device_input = input_ptr + device_offset;
                            auto device_flags = flags_ptr + device_offset;
@@ -991,8 +1076,6 @@ Tensor masked_select(const Tensor& self, const Tensor& mask)
     }
 
     merge_streams();
-
-    C10_CUDA_CHECK(cudaSetDevice(current_device));
 
     return out;
 }
@@ -1056,53 +1139,59 @@ Tensor& scatter_add_out(const Tensor& self, int64_t dim, const Tensor& index, co
     if (!index.numel())
         return out;
 
-    AT_DISPATCH_V2(
-        self.scalar_type(), "scatter_add_out", AT_WRAP([&] {
-            constexpr size_t kAlignment = kPageSize / sizeof(scalar_t);
-            // Give each output page one owning GPU so ordinary device-scope atomics are sufficient.
-            parallel_for_each([&](int device, cudaStream_t stream) {
-                int64_t first_output, device_numel;
-                std::tie(first_output, device_numel) = aligned_chunk(kAlignment, out.numel(), device);
-                if (!device_numel)
-                    return;
+    AT_DISPATCH_V2(self.scalar_type(), "scatter_add_out", AT_WRAP([&] {
+                       scatter_out_impl<scalar_t>(index, out, dim, source.strides(),
+                                                  ScatterAddUpdate<scalar_t>{ source.const_data_ptr<scalar_t>() });
+                   }),
+                   AT_EXPAND(AT_FLOATING_TYPES));
+    return out;
+}
 
-                const auto num_blocks = static_cast<unsigned int>(::cuda::ceil_div(index.numel(), kNumThreads));
-                if (self.dim() == 1)
-                {
-                    offset_lambda_kernel<<<num_blocks, kNumThreads, 0, stream>>>(
-                        index.numel(), 0, ScatterAddFunctor<scalar_t, int64_t>(), dim,
-                        index.packed_accessor64<const int64_t, 1, RestrictPtrTraits>(),
-                        source.packed_accessor64<const scalar_t, 1, RestrictPtrTraits>(), first_output,
-                        first_output + device_numel, out.packed_accessor64<scalar_t, 1, RestrictPtrTraits>());
-                }
-                else if (self.dim() == 2)
-                {
-                    offset_lambda_kernel<<<num_blocks, kNumThreads, 0, stream>>>(
-                        index.numel(), 0, ScatterAddFunctor<scalar_t, int64_t>(), dim,
-                        index.packed_accessor64<const int64_t, 2, RestrictPtrTraits>(),
-                        source.packed_accessor64<const scalar_t, 2, RestrictPtrTraits>(), first_output,
-                        first_output + device_numel, out.packed_accessor64<scalar_t, 2, RestrictPtrTraits>());
-                }
-                else if (self.dim() == 3)
-                {
-                    offset_lambda_kernel<<<num_blocks, kNumThreads, 0, stream>>>(
-                        index.numel(), 0, ScatterAddFunctor<scalar_t, int64_t>(), dim,
-                        index.packed_accessor64<const int64_t, 3, RestrictPtrTraits>(),
-                        source.packed_accessor64<const scalar_t, 3, RestrictPtrTraits>(), first_output,
-                        first_output + device_numel, out.packed_accessor64<scalar_t, 3, RestrictPtrTraits>());
-                }
-                else
-                {
-                    offset_lambda_kernel<<<num_blocks, kNumThreads, 0, stream>>>(
-                        index.numel(), 0, ScatterAddFunctor<scalar_t, int64_t>(), dim,
-                        index.packed_accessor64<const int64_t, 4, RestrictPtrTraits>(),
-                        source.packed_accessor64<const scalar_t, 4, RestrictPtrTraits>(), first_output,
-                        first_output + device_numel, out.packed_accessor64<scalar_t, 4, RestrictPtrTraits>());
-                }
-                C10_CUDA_KERNEL_LAUNCH_CHECK();
-            });
-        }),
-        AT_EXPAND(AT_FLOATING_TYPES));
+Tensor& scatter_src_out(const Tensor& self, int64_t dim, const Tensor& index, const Tensor& source, Tensor& out)
+{
+    TORCH_CHECK(self.device() == index.device() && self.device() == source.device() && self.device() == out.device(),
+                "Expected self, index, source, and out to be on the same device");
+    TORCH_CHECK(self.scalar_type() == source.scalar_type() && self.scalar_type() == out.scalar_type(),
+                "Expected self, source, and out to have the same dtype");
+    TORCH_CHECK(index.scalar_type() == kLong, "scatter expected index to have dtype int64");
+    dim = c10::maybe_wrap_dim(dim, self.dim());
+    assert_no_internal_overlap(out);
+    if (!out.is_same(self))
+        assert_no_overlap(out, self);
+    assert_no_overlap(out, index);
+    assert_no_overlap(out, source);
+
+    // Treat scalars as one-element vectors, as in PyTorch's scatter shape checks.
+    const Tensor input = self.dim() ? self : self.view({ 1 });
+    const Tensor indices = index.dim() ? index : index.view({ 1 });
+    const Tensor src = source.dim() ? source : source.view({ 1 });
+    if (indices.numel())
+    {
+        TORCH_CHECK(indices.dim() == input.dim() && src.dim() == input.dim(),
+                    "Expected index, source, and self to have the same number of dimensions");
+        for (const auto d : c10::irange(input.dim()))
+        {
+            TORCH_CHECK(indices.size(d) <= src.size(d), "Expected index size to be no larger than source size");
+            if (d != dim)
+                TORCH_CHECK(indices.size(d) <= input.size(d), "Expected index size to be no larger than self size");
+        }
+    }
+
+    at::native::resize_output(out, self.sizes());
+    Tensor result = out.is_contiguous() ? out : at::empty(self.sizes(), self.options());
+    if (!result.is_same(self))
+        result.copy_(self);
+    if (indices.numel())
+    {
+        const Tensor output = result.dim() ? result : result.view({ 1 });
+        AT_DISPATCH_V2(self.scalar_type(), "scatter_src_out", AT_WRAP([&] {
+                           scatter_out_impl<scalar_t>(indices, output, dim, src.strides(),
+                                                      ScatterSourceUpdate<scalar_t>{ src.const_data_ptr<scalar_t>() });
+                       }),
+                       AT_EXPAND(AT_ALL_TYPES), kHalf, kBFloat16, kBool);
+    }
+    if (!result.is_same(out))
+        out.copy_(result);
     return out;
 }
 
@@ -1131,111 +1220,98 @@ Tensor& scatter_value_out(const Tensor& self, int64_t dim, const Tensor& index, 
     if (!index.numel())
         return out;
 
-    AT_DISPATCH_V2(
-        self.scalar_type(), "scatter_value_out", AT_WRAP([&] {
-            constexpr size_t kAlignment = kPageSize / sizeof(scalar_t);
-            const auto scalar_value = value.to<scalar_t>();
-            parallel_for_each([&](int device, cudaStream_t stream) {
-                int64_t first_output, device_numel;
-                std::tie(first_output, device_numel) = aligned_chunk(kAlignment, out.numel(), device);
-                if (!device_numel)
-                    return;
-
-                const auto num_blocks = static_cast<unsigned int>(::cuda::ceil_div(index.numel(), kNumThreads));
-                if (self.dim() == 1)
-                {
-                    offset_lambda_kernel<<<num_blocks, kNumThreads, 0, stream>>>(
-                        index.numel(), 0, ScatterValueFunctor<scalar_t, int64_t>(), dim,
-                        index.packed_accessor64<const int64_t, 1, RestrictPtrTraits>(), scalar_value, first_output,
-                        first_output + device_numel, out.packed_accessor64<scalar_t, 1, RestrictPtrTraits>());
-                }
-                else if (self.dim() == 2)
-                {
-                    offset_lambda_kernel<<<num_blocks, kNumThreads, 0, stream>>>(
-                        index.numel(), 0, ScatterValueFunctor<scalar_t, int64_t>(), dim,
-                        index.packed_accessor64<const int64_t, 2, RestrictPtrTraits>(), scalar_value, first_output,
-                        first_output + device_numel, out.packed_accessor64<scalar_t, 2, RestrictPtrTraits>());
-                }
-                else if (self.dim() == 3)
-                {
-                    offset_lambda_kernel<<<num_blocks, kNumThreads, 0, stream>>>(
-                        index.numel(), 0, ScatterValueFunctor<scalar_t, int64_t>(), dim,
-                        index.packed_accessor64<const int64_t, 3, RestrictPtrTraits>(), scalar_value, first_output,
-                        first_output + device_numel, out.packed_accessor64<scalar_t, 3, RestrictPtrTraits>());
-                }
-                else
-                {
-                    offset_lambda_kernel<<<num_blocks, kNumThreads, 0, stream>>>(
-                        index.numel(), 0, ScatterValueFunctor<scalar_t, int64_t>(), dim,
-                        index.packed_accessor64<const int64_t, 4, RestrictPtrTraits>(), scalar_value, first_output,
-                        first_output + device_numel, out.packed_accessor64<scalar_t, 4, RestrictPtrTraits>());
-                }
-                C10_CUDA_KERNEL_LAUNCH_CHECK();
-            });
-        }),
-        AT_EXPAND(AT_ALL_TYPES), kHalf, kBFloat16, kBool);
+    const std::vector<int64_t> source_strides(index.dim(), 0);
+    AT_DISPATCH_V2(self.scalar_type(), "scatter_value_out", AT_WRAP([&] {
+                       scatter_out_impl<scalar_t>(
+                           index, out, dim, source_strides, ScatterValueUpdate<scalar_t>{ value.to<scalar_t>() });
+                   }),
+                   AT_EXPAND(AT_ALL_TYPES), kHalf, kBFloat16, kBool);
     return out;
 }
 
 Tensor& gather_out(const Tensor& self, int64_t dim, const Tensor& index, bool sparse_grad, Tensor& out)
 {
-    TORCH_CHECK(self.is_contiguous());
-    TORCH_CHECK(out.is_contiguous());
     TORCH_CHECK(!sparse_grad, "gather_out does not support sparse_grad");
     TORCH_CHECK(self.dim() == index.dim(), "self and index must have the same number of dimensions");
     TORCH_CHECK(index.scalar_type() == kLong, "gather expected index to have dtype int64");
-    const auto contiguous_index = index.contiguous();
+    TORCH_CHECK(self.scalar_type() == out.scalar_type(), "Expected self and out to have the same dtype");
+    TORCH_CHECK(self.device() == index.device() && self.device() == out.device(),
+                "Expected self, index, and out to be on the same device");
+    dim = c10::maybe_wrap_dim(dim, self.dim());
+    at::native::resize_output(out, index.sizes());
+    assert_no_internal_overlap(out);
+    assert_no_overlap(out, self);
+    assert_no_overlap(out, index);
 
-    if (dim < 0)
+    // The contiguous kernel assumes matching sizes outside the gather dimension.
+    bool all_contiguous = self.is_contiguous() && index.is_contiguous() && out.is_contiguous();
+    for (const auto d : c10::irange(self.dim()))
     {
-        dim += self.dim();
+        if (d == dim)
+            continue;
+        TORCH_CHECK(index.size(d) <= self.size(d), "Expected index size to be no larger than self size");
+        all_contiguous &= index.size(d) == self.size(d);
     }
-
-    const int64_t self_dim_size = self.size(dim);
-    const int64_t index_dim_size = index.size(dim);
-    int64_t inner = 1;
-    for (int64_t i = dim + 1; i < self.dim(); ++i)
-    {
-        inner *= self.size(i);
-    }
-    const int64_t out_row_size = index_dim_size * inner;
-    const int64_t self_row_size = self_dim_size * inner;
+    if (!out.numel())
+        return out;
 
     AT_DISPATCH_V2(
         self.scalar_type(), "gather_out", AT_WRAP([&] {
             using index_t = int64_t;
             const auto self_data = self.const_data_ptr<scalar_t>();
-            const auto indices_data = contiguous_index.const_data_ptr<index_t>();
+            const auto indices_data = index.const_data_ptr<index_t>();
             const auto out_data = out.data_ptr<scalar_t>();
+            const int64_t self_dim_size = self.size(dim);
 
-            parallel_for_each([&](int device, cudaStream_t stream) {
-                int64_t device_offset, device_numel;
-                std::tie(device_offset, device_numel) = aligned_chunk(kPageSize / sizeof(scalar_t), out.numel(), device);
-                if (device_numel == 0)
-                {
-                    return;
-                }
+            if (all_contiguous)
+            {
+                const int64_t index_dim_size = index.size(dim);
+                int64_t inner = 1;
+                for (int64_t d = dim + 1; d < self.dim(); ++d)
+                    inner *= self.size(d);
+                const int64_t out_row_size = index_dim_size * inner;
+                const int64_t self_row_size = self_dim_size * inner;
 
-                C10_CUDA_CHECK(cudaMemPrefetchAsync(out_data + device_offset, device_numel * sizeof(scalar_t),
-                                                    { cudaMemLocationTypeDevice, device }, 0, stream));
-                C10_CUDA_CHECK(cudaMemPrefetchAsync(indices_data + device_offset, device_numel * sizeof(index_t),
-                                                    { cudaMemLocationTypeDevice, device }, 0, stream));
+                parallel_for_each([&](int device, cudaStream_t stream) {
+                    int64_t device_offset, device_numel;
+                    std::tie(device_offset, device_numel) =
+                        partition::aligned_range(kPageSize / sizeof(scalar_t), out.numel(), device);
+                    if (device_numel == 0)
+                    {
+                        return;
+                    }
 
-                if (dim > 0)
-                {
-                    const int64_t outer_offset = device_offset / out_row_size;
-                    const int64_t outer_count = (device_offset + device_numel - 1) / out_row_size + 1 - outer_offset;
-                    C10_CUDA_CHECK(cudaMemPrefetchAsync(self_data + outer_offset * self_row_size,
-                                                        outer_count * self_row_size * sizeof(scalar_t),
+                    C10_CUDA_CHECK(cudaMemPrefetchAsync(out_data + device_offset, device_numel * sizeof(scalar_t),
                                                         { cudaMemLocationTypeDevice, device }, 0, stream));
-                }
+                    C10_CUDA_CHECK(cudaMemPrefetchAsync(indices_data + device_offset, device_numel * sizeof(index_t),
+                                                        { cudaMemLocationTypeDevice, device }, 0, stream));
 
-                const unsigned int device_num_blocks = ::cuda::ceil_div(device_numel, kNumThreads);
-                offset_lambda_kernel<<<device_num_blocks, kNumThreads, 0, stream>>>(
-                    device_numel, device_offset, GatherFunctor<scalar_t, index_t>(), self_dim_size, index_dim_size,
-                    inner, self_data, indices_data, out_data);
-                C10_CUDA_KERNEL_LAUNCH_CHECK();
-            });
+                    if (dim > 0)
+                    {
+                        const int64_t outer_offset = device_offset / out_row_size;
+                        const int64_t outer_count = (device_offset + device_numel - 1) / out_row_size + 1 - outer_offset;
+                        C10_CUDA_CHECK(cudaMemPrefetchAsync(self_data + outer_offset * self_row_size,
+                                                            outer_count * self_row_size * sizeof(scalar_t),
+                                                            { cudaMemLocationTypeDevice, device }, 0, stream));
+                    }
+
+                    const unsigned int device_num_blocks = ::cuda::ceil_div(device_numel, kNumThreads);
+                    offset_lambda_kernel<<<device_num_blocks, kNumThreads, 0, stream>>>(
+                        device_numel, device_offset, GatherFunctor<scalar_t, index_t>(), self_dim_size, index_dim_size,
+                        inner, self_data, indices_data, out_data);
+                    C10_CUDA_KERNEL_LAUNCH_CHECK();
+                });
+            }
+            else
+            {
+                // Offsets supply all coordinates except dim, which comes from index.
+                auto base_strides = self.strides().vec();
+                base_strides[dim] = 0;
+                const auto offsets = make_strided_offset_calculator<3>(
+                    index.sizes(), std::array<IntArrayRef, 3>{ base_strides, index.strides(), out.strides() });
+                mgpu_launch_func(out.numel(), GatherFunctor<scalar_t, index_t>(), self_data, indices_data, out_data,
+                                 self_dim_size, self.stride(dim), offsets);
+            }
         }),
         AT_EXPAND(AT_ALL_TYPES));
 
@@ -1246,11 +1322,13 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m)
 {
     m.impl(TORCH_SELECTIVE_NAME("aten::index.Tensor_out"), TORCH_FN(index_out));
     m.impl(TORCH_SELECTIVE_NAME("aten::_index_put_impl_"), TORCH_FN(index_put));
+    m.impl(TORCH_SELECTIVE_NAME("aten::index_fill_.int_Scalar"), TORCH_FN(index_fill_));
     m.impl(TORCH_SELECTIVE_NAME("aten::index_select"), TORCH_FN(index_select));
     m.impl(TORCH_SELECTIVE_NAME("aten::repeat_interleave.Tensor"), TORCH_FN(repeat_interleave));
     m.impl(TORCH_SELECTIVE_NAME("aten::masked_select"), TORCH_FN(masked_select));
     m.impl(TORCH_SELECTIVE_NAME("aten::index_add.out"), TORCH_FN(index_add_out));
     m.impl(TORCH_SELECTIVE_NAME("aten::scatter_add.out"), TORCH_FN(scatter_add_out));
+    m.impl(TORCH_SELECTIVE_NAME("aten::scatter.src_out"), TORCH_FN(scatter_src_out));
     m.impl(TORCH_SELECTIVE_NAME("aten::scatter.value_out"), TORCH_FN(scatter_value_out));
     m.impl(TORCH_SELECTIVE_NAME("aten::gather.out"), TORCH_FN(gather_out));
 }

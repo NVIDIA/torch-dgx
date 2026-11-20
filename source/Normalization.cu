@@ -215,7 +215,7 @@ __global__ __launch_bounds__(kNumThreads) void rms_norm_backward_kernel(int64_t 
 template <typename scalar_t>
 struct RMSNormWeightBackward
 {
-    __device__ void operator()(int64_t feature,
+    __device__ void operator()(int64_t packed_feature,
                                int64_t begin,
                                int64_t count,
                                int64_t width,
@@ -224,8 +224,10 @@ struct RMSNormWeightBackward
                                const scalar_t* input,
                                const scalar_t* grad,
                                const scalar_t* rstd,
-                               scalar_t* partial)
+                               scalar_t* partial,
+                               int devices)
     {
+        const auto feature = partition::logical_index(1, width, devices, packed_feature);
         scalar_t sum = 0;
         if (feature < width)
         {
@@ -235,7 +237,7 @@ struct RMSNormWeightBackward
                 sum += grad[grad_layout.row_offset(row) + g_offset] *
                        (input[layout.row_offset(row) + x_offset] * rstd[row]);
         }
-        partial[feature] = sum;
+        partial[packed_feature] = sum;
     }
 };
 
@@ -402,16 +404,16 @@ __device__ void layer_norm_store_parameter_sums(accscalar_t weight_sum,
 
 template <typename scalar_t, typename accscalar_t>
 __global__ __launch_bounds__(kNumThreads) void layer_norm_parameter_partials_kernel(int64_t row_offset,
-                                                                                   int64_t row_count,
-                                                                                   int64_t normalized_size,
-                                                                                   int64_t row_tiles,
-                                                                                   int64_t feature_tiles,
-                                                                                   const scalar_t* grad_output,
-                                                                                   const scalar_t* input,
-                                                                                   const accscalar_t* mean,
-                                                                                   const accscalar_t* rstd,
-                                                                                   accscalar_t* partial_weight,
-                                                                                   accscalar_t* partial_bias)
+                                                                                    int64_t row_count,
+                                                                                    int64_t normalized_size,
+                                                                                    int64_t row_tiles,
+                                                                                    int64_t feature_tiles,
+                                                                                    const scalar_t* grad_output,
+                                                                                    const scalar_t* input,
+                                                                                    const accscalar_t* mean,
+                                                                                    const accscalar_t* rstd,
+                                                                                    accscalar_t* partial_weight,
+                                                                                    accscalar_t* partial_bias)
 {
     __shared__ accscalar_t shared_weight[kNumThreads];
     __shared__ accscalar_t shared_bias[kNumThreads];
@@ -438,17 +440,17 @@ __global__ __launch_bounds__(kNumThreads) void layer_norm_parameter_partials_ker
             }
         }
         layer_norm_store_parameter_sums(weight_sum, bias_sum, shared_weight, shared_bias, feature < normalized_size,
-                                       row_tile * normalized_size + feature, partial_weight, partial_bias);
+                                        row_tile * normalized_size + feature, partial_weight, partial_bias);
     }
 }
 
 template <typename accscalar_t>
 __global__ __launch_bounds__(kNumThreads) void layer_norm_parameter_reduce_kernel(int64_t normalized_size,
-                                                                                 int64_t row_tiles,
-                                                                                 const accscalar_t* partial_weight,
-                                                                                 const accscalar_t* partial_bias,
-                                                                                 accscalar_t* grad_weight,
-                                                                                 accscalar_t* grad_bias)
+                                                                                  int64_t row_tiles,
+                                                                                  const accscalar_t* partial_weight,
+                                                                                  const accscalar_t* partial_bias,
+                                                                                  accscalar_t* grad_weight,
+                                                                                  accscalar_t* grad_bias)
 {
     __shared__ accscalar_t shared_weight[kNumThreads];
     __shared__ accscalar_t shared_bias[kNumThreads];
@@ -470,7 +472,7 @@ __global__ __launch_bounds__(kNumThreads) void layer_norm_parameter_reduce_kerne
             }
         }
         layer_norm_store_parameter_sums(weight_sum, bias_sum, shared_weight, shared_bias, feature < normalized_size,
-                                       feature, grad_weight, grad_bias);
+                                        feature, grad_weight, grad_bias);
     }
 }
 
@@ -489,8 +491,8 @@ void layer_norm_parameter_backward(int64_t row_offset,
     if (row_count <= kLayerNormParameterSmallRows)
     {
         // Also writes zeroes for empty shards, which must still participate in NCCL.
-        const auto blocks = static_cast<unsigned int>(
-            std::min<int64_t>(::cuda::ceil_div(normalized_size, int64_t(kNumThreads)), 65535));
+        const auto blocks =
+            static_cast<unsigned int>(std::min<int64_t>(::cuda::ceil_div(normalized_size, int64_t(kNumThreads)), 65535));
         lambda_kernel<<<blocks, kNumThreads, 0, stream>>>(
             normalized_size, LayerNormParameterBackwardFunctor<scalar_t, accscalar_t>(), row_offset, row_count,
             normalized_size, grad_output, input, mean, rstd, grad_weight, grad_bias);
@@ -739,10 +741,10 @@ std::tuple<Tensor, Tensor> fused_rms_norm_backward(const Tensor& grad_output,
                                lambda_kernel<<<blocks, kNumThreads, 0, stream>>>(
                                    padded, RMSNormWeightBackward<scalar_t>(), begin, count, width, layout, grad_layout,
                                    input.const_data_ptr<scalar_t>(), grad_output.const_data_ptr<scalar_t>(),
-                                   stats.const_data_ptr<scalar_t>(), partials[device]);
+                                   stats.const_data_ptr<scalar_t>(), partials[device], c10::cuda::device_count());
                                C10_CUDA_KERNEL_LAUNCH_CHECK();
                            });
-                           nccl_reduce_scatter_partials(partials, grad_weight.data_ptr<scalar_t>(), width);
+                           nccl_reduce_scatter_packed_partials(partials, grad_weight.data_ptr<scalar_t>(), width);
                            parallel_for_each_async([&](int device, cudaStream_t stream) {
                                C10_CUDA_CHECK(cudaFreeAsync(partials[device], stream));
                            });
@@ -780,7 +782,7 @@ std::tuple<Tensor, Tensor, Tensor> batch_norm(const Tensor& self,
 
                        parallel_for_each([&](int device, cudaStream_t stream) {
                            int64_t device_offset, device_channels;
-                           std::tie(device_offset, device_channels) = chunk(self.size(1), device);
+                           std::tie(device_offset, device_channels) = partition::range(self.size(1), device);
                            if (device_channels)
                            {
                                batch_norm_welford_kernel<scalar_t>
@@ -808,8 +810,6 @@ std::tuple<Tensor, Tensor, Tensor> native_layer_norm_backward(const Tensor& grad
                                                               const std::optional<Tensor>& bias_opt,
                                                               std::array<bool, 3> output_mask)
 {
-    int device = cudaInvalidDeviceId;
-    C10_CUDA_CHECK(cudaGetDevice(&device));
     TORCH_CHECK(!normalized_shape.empty(), "Expected normalized_shape to contain at least one element");
     TORCH_CHECK(input.dim() >= normalized_shape.size(), "normalized_shape has more dimensions than the input");
     TORCH_CHECK(grad_output.sizes() == input.sizes(), "Expected grad_output and input to have the same shape");
@@ -882,7 +882,7 @@ std::tuple<Tensor, Tensor, Tensor> native_layer_norm_backward(const Tensor& grad
                 // Keep their work stream-ordered and join once at the operator boundary.
                 parallel_for_each_async([&](int device, cudaStream_t stream) {
                     int64_t row_offset, row_count;
-                    std::tie(row_offset, row_count) = chunk(num_rows, device);
+                    std::tie(row_offset, row_count) = partition::range(num_rows, device);
                     if (row_count)
                     {
                         const auto num_blocks = static_cast<unsigned int>(row_count);
@@ -906,7 +906,7 @@ std::tuple<Tensor, Tensor, Tensor> native_layer_norm_backward(const Tensor& grad
 
                 parallel_for_each_async([&](int device, cudaStream_t stream) {
                     int64_t row_offset, row_count;
-                    std::tie(row_offset, row_count) = chunk(num_rows, device);
+                    std::tie(row_offset, row_count) = partition::range(num_rows, device);
                     C10_CUDA_CHECK(
                         cudaMallocAsync(&partial_gradients[device], partial_numel * sizeof(accscalar_t), stream));
                     auto* partial_grad_weight = grad_weight.defined() ? partial_gradients[device] : nullptr;
@@ -935,7 +935,6 @@ std::tuple<Tensor, Tensor, Tensor> native_layer_norm_backward(const Tensor& grad
         }),
         AT_EXPAND(AT_FLOATING_TYPES));
 
-    C10_CUDA_CHECK(cudaSetDevice(device));
     return std::make_tuple(grad_input, grad_weight, grad_bias);
 }
 

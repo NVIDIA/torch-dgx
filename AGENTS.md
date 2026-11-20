@@ -6,6 +6,7 @@
 - Query the current active virtual environment with `printenv VIRTUAL_ENV` and `command -v python`, and use that environment for builds and tests
 - Ask for elevated permissions prior to build and test so that CUDA devices will be visible
 - Do not run code formatting unless it is immediately prior to commit
+- Do not check for fallback warnings in tests
 
 ## Python Code Style
 

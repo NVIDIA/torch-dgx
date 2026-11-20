@@ -50,6 +50,48 @@ def test_dense_same_dtype_copy(
     _assert_copy(source, destination, expected)
 
 
+@pytest.mark.parametrize("non_blocking", [False, True], ids=["blocking", "nonblocking"])
+@pytest.mark.parametrize(
+    "dtype,transpose",
+    [(torch.float32, False), (torch.float64, True)],
+    ids=["dense", "cast-and-transpose"],
+)
+def test_pinned_upload_source_lifetime(
+    dgx_setup_teardown, non_blocking, dtype, transpose
+):
+    storage_shape = (256 * 512 + 1,)
+    storage = torch.full(storage_shape, 7.0, pin_memory=True)
+    source = storage[1:].view(256, 512)
+    if transpose:
+        source = source.t()
+    destination = torch.empty(source.shape, dtype=dtype, device="dgx")
+    # Warm up allocation and copy paths before delaying DMA on the last GPU.
+    destination.copy_(source)
+    for device in range(torch.cuda.device_count()):
+        torch.cuda.synchronize(device)
+    delayed_device = torch.cuda.device_count() - 1
+    with torch.cuda.device(delayed_device):
+        torch.cuda._sleep(500_000_000)
+
+    destination.copy_(source, non_blocking=non_blocking)
+    if non_blocking:
+        copy_done = torch.cuda.Event()
+        copy_done.record(torch.cuda.current_stream(delayed_device))
+        assert not copy_done.query(), "pinned nonblocking upload unexpectedly blocked"
+        del source, storage
+        # Keep replacement allocations alive to exercise premature buffer reuse.
+        _replacements = [
+            torch.full(storage_shape, 9.0, pin_memory=True) for _ in range(8)
+        ]
+    else:
+        # A blocking upload must permit immediate mutation of the source.
+        source.fill_(9.0)
+
+    assert torch.equal(
+        destination.cpu(), torch.full(destination.shape, 7.0, dtype=dtype)
+    )
+
+
 @pytest.mark.parametrize(
     "source_device,destination_device,source_dtype,destination_dtype",
     [

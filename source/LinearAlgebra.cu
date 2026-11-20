@@ -7,9 +7,11 @@
 #include "StridedTensorUtils.cuh"
 
 #include <ATen/Dispatch_v2.h>
+#include <ATen/ExpandUtils.h>
 #include <ATen/MemoryOverlap.h>
 #include <ATen/OpMathType.h>
 #include <ATen/TensorIterator.h>
+#include <ATen/WrapDimUtils.h>
 #include <ATen/native/Resize.h>
 #include <ATen/ops/empty.h>
 #include <ATen/ops/empty_like.h>
@@ -166,7 +168,7 @@ void vector_norm_async(int64_t numel,
         auto stream = c10::cuda::getCurrentCUDAStream(device_id);
 
         int64_t device_offset, device_numel;
-        std::tie(device_offset, device_numel) = chunk(numel, device_id);
+        std::tie(device_offset, device_numel) = partition::range(numel, device_id);
         size_t scratch_size = 0;
         void* scratch_data = nullptr;
 
@@ -232,14 +234,23 @@ void vector_norm_async(int64_t numel,
 template <class T>
 struct CrossProductFunctor
 {
-    __device__ void operator()(size_t tid,
-                               const PackedTensorAccessor64<T, 2> self,
-                               const PackedTensorAccessor64<T, 2> other,
-                               PackedTensorAccessor64<T, 2> out)
+    int64_t self_stride;
+    int64_t other_stride;
+    int64_t out_stride;
+
+    __device__ void operator()(int64_t index, const T* self, const T* other, T* out, StridedOffsetCalculator<3> offsets) const
     {
-        out[tid][0] = self[tid][1] * other[tid][2] - self[tid][2] * other[tid][1];
-        out[tid][1] = self[tid][2] * other[tid][0] - self[tid][0] * other[tid][2];
-        out[tid][2] = self[tid][0] * other[tid][1] - self[tid][1] * other[tid][0];
+        const auto tensor_offsets = offsets.get(index);
+        self += tensor_offsets[0];
+        other += tensor_offsets[1];
+        out += tensor_offsets[2];
+
+        // Read each vector before writing, since out may alias an input.
+        const T x0 = self[0], x1 = self[self_stride], x2 = self[2 * self_stride];
+        const T y0 = other[0], y1 = other[other_stride], y2 = other[2 * other_stride];
+        out[0] = x1 * y2 - x2 * y1;
+        out[out_stride] = x2 * y0 - x0 * y2;
+        out[2 * out_stride] = x0 * y1 - x1 * y0;
     }
 };
 
@@ -307,9 +318,6 @@ Tensor& linalg_vector_norm_out(const Tensor& self,
             return out;
         }
 
-        int device = cudaInvalidDeviceId;
-        C10_CUDA_CHECK(cudaGetDevice(&device));
-
         Tensor device_outs = at::empty({ c10::cuda::device_count() }, out.options());
         AT_DISPATCH_V2(
             out.scalar_type(), "linalg_vector_norm_out", AT_WRAP([&] {
@@ -372,7 +380,6 @@ Tensor& linalg_vector_norm_out(const Tensor& self,
             }),
             AT_EXPAND(AT_FLOATING_TYPES));
 
-        C10_CUDA_CHECK(cudaSetDevice(device));
         return out;
     }
 
@@ -428,23 +435,37 @@ Tensor& linalg_vector_norm_out(const Tensor& self,
 
 Tensor& linalg_cross_out(const Tensor& self, const Tensor& other, int64_t dim, Tensor& out)
 {
-    TORCH_CHECK(dim == -1, "non-default dim is not supported in linalg_cross_out")
-
+    TORCH_CHECK(self.dim() == other.dim(), "linalg.cross: inputs must have the same number of dimensions.");
+    dim = at::maybe_wrap_dim(dim, self.dim());
+    TORCH_CHECK(self.size(dim) == 3 && other.size(dim) == 3, "linalg.cross: inputs dimension ", dim,
+                " must have length 3. Got ", self.size(dim), " and ", other.size(dim));
+    TORCH_CHECK(self.device() == other.device() && self.device() == out.device(),
+                "linalg.cross: inputs and output must be on the same device");
     TORCH_CHECK(self.scalar_type() == out.scalar_type(), "mismatched type in linalg_cross_out");
     TORCH_CHECK(other.scalar_type() == out.scalar_type(), "mismatched type in linalg_cross_out");
-    TORCH_CHECK(self.dim() == 2);
-    TORCH_CHECK(self.sizes()[1] == 3);
-    TORCH_CHECK(other.dim() == 2);
-    TORCH_CHECK(other.sizes()[1] == 3);
-    TORCH_CHECK(out.dim() == 2);
-    TORCH_CHECK(out.sizes()[1] == 3);
 
-    AT_DISPATCH_V2(out.scalar_type(), "linalg_cross_out", AT_WRAP([&] {
-                       mgpu_launch_func(out.sizes()[0], CrossProductFunctor<scalar_t>(),
-                                        self.packed_accessor64<scalar_t, 2>(), other.packed_accessor64<scalar_t, 2>(),
-                                        out.packed_accessor64<scalar_t, 2>());
-                   }),
-                   AT_EXPAND(AT_FLOATING_TYPES));
+    const auto shape = at::infer_size_dimvector(self.sizes(), other.sizes());
+    at::native::resize_output(out, shape);
+    const auto self_expanded = self.expand(shape);
+    const auto other_expanded = other.expand(shape);
+    at::assert_no_internal_overlap(out);
+    at::assert_no_partial_overlap(out, self_expanded);
+    at::assert_no_partial_overlap(out, other_expanded);
+    if (out.numel() == 0)
+        return out;
+
+    // Each work item handles one vector, omitting the cross-product dimension from the batch offsets.
+    const auto layout = make_reduction_layout<3>(
+        shape, dim, std::array<IntArrayRef, 3>{ self_expanded.strides(), other_expanded.strides(), out.strides() });
+
+    AT_DISPATCH_V2(
+        out.scalar_type(), "linalg_cross_out", AT_WRAP([&] {
+            const auto func =
+                CrossProductFunctor<scalar_t>{ self_expanded.stride(dim), other_expanded.stride(dim), out.stride(dim) };
+            mgpu_launch_func(layout.num_segments, func, self_expanded.const_data_ptr<scalar_t>(),
+                             other_expanded.const_data_ptr<scalar_t>(), out.data_ptr<scalar_t>(), layout.offsets);
+        }),
+        AT_EXPAND(AT_FLOATING_TYPES));
 
     return out;
 }

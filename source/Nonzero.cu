@@ -85,14 +85,11 @@ Tensor nonzero(const Tensor& self)
     TORCH_CHECK(self.dim() <= kMaxNonzeroDims, "nonzero does not support tensors with more than ", kMaxNonzeroDims,
                 " dimensions");
 
-    int device = cudaInvalidDeviceId;
-    cudaGetDevice(&device);
-
     std::vector<int64_t> device_numels(c10::cuda::device_count());
     std::vector<int64_t> device_offsets(c10::cuda::device_count());
     for (const auto device_id : c10::irange(c10::cuda::device_count()))
     {
-        std::tie(device_offsets[device_id], device_numels[device_id]) = chunk(self.numel(), device_id);
+        std::tie(device_offsets[device_id], device_numels[device_id]) = partition::range(self.numel(), device_id);
     }
 
     std::vector<int64_t*> device_nonzero_counts(c10::cuda::device_count());
@@ -170,8 +167,6 @@ Tensor nonzero(const Tensor& self)
         auto stream = c10::cuda::getCurrentCUDAStream(device_id);
         C10_CUDA_CHECK(cudaFreeAsync(device_nonzero_counts[device_id], stream));
     }
-
-    cudaSetDevice(device);
 
     auto out = at::empty({ nonzero_counts, self.dim() }, self.options().dtype(kLong));
     LinearToCoordinatesFunctor linear_to_coordinates{ self.dim(), {} };

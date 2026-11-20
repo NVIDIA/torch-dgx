@@ -30,6 +30,18 @@ def test_index_out_integer_indices(dgx_setup_teardown, dtype):
     assert torch.equal(subtensor.to("cpu"), tensor.to("cpu")[indices])
 
 
+@pytest.mark.parametrize("selection", [[4, 0, 2], [3, 0, 1], []])
+def test_index_out_bool(dgx_setup_teardown, selection):
+    mask = torch.tensor([True, False, True, False, True])
+    indices = torch.tensor(selection, dtype=torch.int64)
+    expected = mask[indices]
+
+    actual = mask.to("dgx")[indices.to("dgx")]
+
+    torch.testing.assert_close(actual.cpu(), expected)
+    assert bool(actual.all()) == bool(expected.all())
+
+
 @pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64], ids=str)
 @pytest.mark.parametrize("count", [0, 1, 17, 262_147])
 @pytest.mark.parametrize("trailing_shape", [(), (3,), (15, 3)])
@@ -183,11 +195,27 @@ def test_repeat_interleave_tensor_output_size(dgx_setup_teardown, dtype, values)
     )
 
 
-@pytest.mark.parametrize("dtype", datatypes, ids=str)
+@pytest.mark.parametrize("dtype", [torch.bool, torch.float32, torch.int64], ids=str)
+@pytest.mark.parametrize("dim", [0, -1])
+@pytest.mark.parametrize("selection", [[0, 99, -1, 99, 0], []])
+def test_index_fill(dgx_setup_teardown, dtype, dim, selection):
+    source = torch.randint(0, 2 if dtype == torch.bool else 10, (3, 5)).to(dtype)
+    actual = source.to("dgx").t()
+    expected = source.t()
+    indices = torch.tensor(selection, dtype=torch.int64)
+
+    expected.index_fill_(dim, indices[::2], 1)
+    assert actual.index_fill_(dim, indices.to("dgx")[::2], 1) is actual
+
+    torch.testing.assert_close(actual.cpu(), expected)
+
+
+@pytest.mark.parametrize("dtype", datatypes + [torch.bool], ids=str)
 def test_index_put_elementwise_mask(dgx_setup_teardown, dtype):
-    expected = torch.arange(0, 10, 1.5, dtype=dtype)
-    result = expected.to("dgx")
+    expected = torch.arange(0, 10, 1.5)
     mask = expected.ge(5.0)
+    expected = expected.to(dtype)
+    result = expected.to("dgx")
 
     expected[mask] = 0.0
     result[mask.to("dgx")] = 0.0
@@ -238,13 +266,21 @@ def test_index_put_elementwise_mask(dgx_setup_teardown, dtype):
             True,
             id="accumulate-rank2-float32",
         ),
+        pytest.param(
+            torch.bool,
+            (2, 3),
+            "mixed",
+            (5,),
+            False,
+            id="mixed-rank2-bool",
+        ),
     ],
 )
 def test_index_put_boolean_prefix_mask(
     dgx_setup_teardown, dtype, mask_shape, selection, trailing_shape, accumulate
 ):
     shape = (*mask_shape, *trailing_shape)
-    expected = torch.arange(prod(shape), dtype=dtype).reshape(shape)
+    expected = torch.arange(prod(shape)).reshape(shape).to(dtype)
     result = expected.to("dgx")
     if selection == "mixed":
         mask = torch.arange(prod(mask_shape)).reshape(mask_shape) % 3 != 0
@@ -252,11 +288,12 @@ def test_index_put_boolean_prefix_mask(
         mask = torch.full(mask_shape, selection == "all", dtype=torch.bool)
     num_selected = int(mask.sum().item())
     values = (
-        torch.arange(num_selected * prod(trailing_shape), dtype=dtype).reshape(
+        torch.arange(num_selected * prod(trailing_shape)).reshape(
             num_selected, *trailing_shape
         )
         + 100
     )
+    values = (values % 2 if dtype == torch.bool else values).to(dtype)
 
     expected.index_put_((mask,), values, accumulate=accumulate)
     result.index_put_((mask.to("dgx"),), values.to("dgx"), accumulate=accumulate)
@@ -282,13 +319,16 @@ def test_index_put_boolean_mask_accumulate_scalar(dgx_setup_teardown):
         pytest.param(torch.float32, (11,), "cpu", id="rank1-float32-cpu-indices"),
         pytest.param(torch.int32, (11, 3), "dgx", id="rank2-int32"),
         pytest.param(torch.float64, (11, 2, 4), "dgx", id="rank3-float64"),
+        pytest.param(torch.bool, (11, 3), "dgx", id="rank2-bool"),
     ],
 )
 def test_index_put_rows_tensor_values(dgx_setup_teardown, dtype, shape, indices_device):
-    expected = torch.arange(prod(shape), dtype=dtype).reshape(shape)
+    expected = torch.arange(prod(shape)).reshape(shape).to(dtype)
     result = expected.to("dgx")
     indices = torch.tensor([8, 2, 5, 1, -1], dtype=torch.int64, device=indices_device)
-    values = torch.full((len(indices), *shape[1:]), -3.5, dtype=dtype)
+    values = torch.full(
+        (len(indices), *shape[1:]), False if dtype == torch.bool else -3.5, dtype=dtype
+    )
 
     expected[indices.cpu()] = values
     result[indices] = values.to("dgx")
@@ -296,13 +336,17 @@ def test_index_put_rows_tensor_values(dgx_setup_teardown, dtype, shape, indices_
     assert torch.equal(result.cpu(), expected)
 
 
-def test_index_put_rows_python_scalar(dgx_setup_teardown):
-    expected = torch.arange(11, dtype=torch.float32)
+@pytest.mark.parametrize(
+    "dtype,value", [(torch.float32, -2.5), (torch.bool, True), (torch.bool, False)]
+)
+@pytest.mark.parametrize("selection", [[8, 2, 5, 1, -1], list(range(11))])
+def test_index_put_rows_python_scalar(dgx_setup_teardown, dtype, value, selection):
+    expected = torch.arange(11).to(dtype)
     result = expected.to("dgx")
-    indices = torch.tensor([8, 2, 5, 1, -1], dtype=torch.int64, device="dgx")
+    indices = torch.tensor(selection, dtype=torch.int64, device="dgx")
 
-    expected[indices.cpu()] = -2.5
-    result[indices] = -2.5
+    expected[indices.cpu()] = value
+    result[indices] = value
 
     assert torch.equal(result.cpu(), expected)
 
@@ -353,6 +397,53 @@ def test_index_put_rows_duplicate_destinations_are_deterministic(
         result = initial.to("dgx")
         result[indices.to("dgx")] = values.to("dgx")
         assert torch.equal(result.to("cpu"), expected)
+
+
+@pytest.mark.parametrize(
+    "dtype,index_dtype,scalar_device",
+    [
+        (torch.float32, torch.int32, None),
+        (torch.float64, torch.int64, None),
+        (torch.bool, torch.int64, None),
+        (torch.float32, torch.int64, "cpu"),
+        (torch.float32, torch.int64, "dgx"),
+    ],
+)
+def test_index_put_rows_accumulate(
+    dgx_setup_teardown, dtype, index_dtype, scalar_device
+):
+    expected = torch.arange(33).reshape(11, 3).to(dtype)
+    result = expected.to("dgx")
+    indices = torch.tensor([8, 2, 8, -3, 2], dtype=index_dtype)
+
+    if scalar_device is None:
+        base = torch.arange(15).reshape(3, 5).to(dtype)
+        values = base.t()
+        dgx_values = base.to("dgx").t()
+    else:
+        values = torch.tensor(2.5, dtype=dtype)
+        dgx_values = values.to(scalar_device)
+
+    expected.index_put_((indices,), values, accumulate=True)
+    result.index_put_((indices.to("dgx"),), dgx_values, accumulate=True)
+
+    torch.testing.assert_close(result.cpu(), expected)
+
+
+@pytest.mark.parametrize("shape", [(11,), (11, 3)])
+def test_index_backward_duplicate_indices(dgx_setup_teardown, shape):
+    samples = torch.randn(shape, dtype=torch.float64, requires_grad=True)
+    dgx_samples = samples.detach().to("dgx").requires_grad_()
+    indices = torch.tensor([8, 2, 8, 1, 2])
+    expected = samples[indices]
+    actual = dgx_samples[indices.to("dgx")]
+    grad_output = torch.randn_like(expected)
+
+    expected.backward(grad_output)
+    actual.backward(grad_output.to("dgx"))
+
+    torch.testing.assert_close(actual.cpu(), expected)
+    torch.testing.assert_close(dgx_samples.grad.cpu(), samples.grad)
 
 
 def test_index_put_rows_rejects_partial_values_overlap(dgx_setup_teardown):
@@ -431,6 +522,17 @@ def test_gather_3d(dgx_setup_teardown, dtype, dim):
     assert torch.equal(result.to("cpu"), torch.gather(tensor, dim, index))
 
 
+def test_gather_strided(dgx_setup_teardown):
+    source = torch.randn(3, 4, 5)
+    input = source.to("dgx").transpose(1, 2)
+    index = torch.randint(4, (2, 3, 2))
+    storage = torch.full((2, 3, 5), -99.0, device="dgx")
+    torch.gather(input, -1, index.to("dgx"), out=storage[:, :, 1::2])
+    expected = torch.full((2, 3, 5), -99.0)
+    expected[:, :, 1::2] = source.transpose(1, 2).gather(-1, index)
+    torch.testing.assert_close(storage.cpu(), expected)
+
+
 @pytest.mark.parametrize("dtype", datatypes, ids=str)
 @pytest.mark.parametrize("grad_output_layout", ["contiguous", "zero-stride"])
 def test_gather_expanded_index_forward_backward(
@@ -475,6 +577,52 @@ def test_scatter_add_out(dgx_setup_teardown, dtype, shape, dim):
     torch.testing.assert_close(
         out.cpu(), torch.scatter_add(self_cpu, dim, index, source_cpu)
     )
+
+
+@pytest.mark.parametrize("dtype", datatypes, ids=str)
+@pytest.mark.parametrize("shape,dim", scatter_cases)
+def test_scatter_src_out(dgx_setup_teardown, dtype, shape, dim):
+    self_cpu = torch.randn(shape, dtype=dtype)
+    # A permutation makes every destination unique so CPU and DGX agree exactly.
+    index = (
+        torch.arange(shape[dim] - 1, -1, -1)
+        .reshape([shape[dim] if d == dim else 1 for d in range(len(shape))])
+        .expand(shape)
+    )
+    source_cpu = torch.randn(shape, dtype=dtype)
+    tensor = self_cpu.to("dgx")
+    dgx_index = index.to("dgx")
+    source = source_cpu.to("dgx")
+    out = torch.empty(0, dtype=dtype, device="dgx")
+    returned = torch.scatter(tensor, dim, dgx_index, source, out=out)
+    assert returned is out
+    expected = self_cpu.scatter(dim, index, source_cpu)
+    torch.testing.assert_close(out.cpu(), expected)
+    tensor.scatter_(dim, dgx_index, source)
+    torch.testing.assert_close(tensor.cpu(), expected)
+
+
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        torch.float32,
+        torch.float64,
+        torch.int64,
+        torch.float16,
+        torch.bfloat16,
+        torch.bool,
+    ],
+)
+def test_scatter_src_strided(dgx_setup_teardown, dtype):
+    self_cpu = torch.arange(35).reshape(5, 7).to(dtype).t()
+    source_cpu = torch.arange(42).reshape(6, 7).to(dtype).t()
+    index = torch.tensor([[4, 0, 2]]).expand(7, 3)
+    storage = torch.full((7, 10), 1, dtype=dtype, device="dgx")
+    out = storage[:, ::2]
+    dgx_index = index[:1].to("dgx").expand(7, 3)
+    torch.scatter(self_cpu.to("dgx"), -1, dgx_index, source_cpu.to("dgx"), out=out)
+    torch.testing.assert_close(out.cpu(), self_cpu.scatter(-1, index, source_cpu))
+    assert torch.all(storage[:, 1::2].cpu() == 1)
 
 
 @pytest.mark.parametrize("dtype", datatypes, ids=str)

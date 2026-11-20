@@ -7,6 +7,74 @@ from torch.library import opcheck
 datatypes = [torch.float32, torch.float64]
 
 
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        torch.bool,
+        torch.int32,
+        torch.int64,
+        torch.float16,
+        torch.bfloat16,
+        torch.float32,
+        torch.float64,
+    ],
+)
+@pytest.mark.parametrize("layout", ["broadcast", "strided", "scalar"])
+def test_minimum(dgx_setup_teardown, dtype, layout):
+    lhs = torch.tensor([[3, -2, 0], [1, 4, -1]], dtype=dtype)
+    rhs = torch.tensor([[2, -3, 1]], dtype=dtype)
+    if layout == "strided":
+        lhs, rhs = lhs.t(), rhs.t()
+    elif layout == "scalar":
+        rhs = torch.tensor(1, dtype=dtype)
+    actual_lhs = lhs.to("dgx")
+    actual_rhs = rhs if layout == "scalar" else rhs.to("dgx")
+    expected = torch.minimum(lhs, rhs)
+    torch.testing.assert_close(torch.minimum(actual_lhs, actual_rhs).cpu(), expected)
+    # Exercise a strided out= buffer and its untouched padding.
+    storage = torch.full((*expected.shape, 2), 1, dtype=dtype, device="dgx")
+    out = storage[..., 0]
+    assert torch.minimum(actual_lhs, actual_rhs, out=out) is out
+    torch.testing.assert_close(out.cpu(), expected)
+    assert bool((storage.cpu()[..., 1] == 1).all())
+
+
+@pytest.mark.parametrize("dtype", datatypes, ids=str)
+def test_minimum_special_values_and_backward(dgx_setup_teardown, dtype):
+    lhs = torch.tensor(
+        [float("nan"), 1, -0.0, 0.0, float("inf"), -float("inf")], dtype=dtype
+    )
+    rhs = torch.tensor(
+        [1, float("nan"), 0.0, -0.0, -float("inf"), float("inf")], dtype=dtype
+    )
+    expected = torch.minimum(lhs, rhs)
+    actual = torch.minimum(lhs.to("dgx"), rhs.to("dgx")).cpu()
+    torch.testing.assert_close(actual, expected, equal_nan=True)
+    assert torch.equal(actual.signbit(), expected.signbit())
+
+    lhs = torch.tensor([1.0, 2.0, 3.0], dtype=dtype, requires_grad=True)
+    rhs = torch.tensor([2.0, 2.0, 1.0], dtype=dtype, requires_grad=True)
+    a = lhs.detach().to("dgx").requires_grad_()
+    b = rhs.detach().to("dgx").requires_grad_()
+    torch.minimum(lhs, rhs).sum().backward()
+    torch.minimum(a, b).sum().backward()
+    torch.testing.assert_close(a.grad.cpu(), lhs.grad)
+    torch.testing.assert_close(b.grad.cpu(), rhs.grad)
+
+
+@pytest.mark.parametrize("dtype", datatypes, ids=str)
+def test_atan2(dgx_setup_teardown, dtype):
+    xyz_cpu = torch.randn(2, 11, 3, dtype=dtype)
+    x, y, _ = xyz_cpu.to("dgx").unbind(-1)
+    expected = torch.atan2(xyz_cpu[..., 1], xyz_cpu[..., 0])
+    torch.testing.assert_close(torch.atan2(y, x).cpu(), expected)
+    opcheck(torch.ops.aten.atan2.default, (y, x))
+
+    out = torch.empty_like(x)
+    assert torch.atan2(y, x, out=out) is out
+    torch.testing.assert_close(out.cpu(), expected)
+
+
 @pytest.mark.parametrize("dtype", datatypes, ids=str)
 def test_hypot(dgx_setup_teardown, dtype):
     lhs = torch.randn(2, 11, dtype=dtype).to("dgx")
@@ -344,6 +412,48 @@ def test_div(dgx_setup_teardown, dtype):
     actual = torch.div(numerator, denominator)
     expected = torch.div(numerator.cpu(), denominator.cpu())
     torch.testing.assert_close(actual.cpu(), expected)
+
+
+@pytest.mark.parametrize("dtype", [torch.int64, torch.float64], ids=str)
+def test_floor_divide(dgx_setup_teardown, dtype):
+    samples = torch.arange(-20, 22).reshape(6, 7).to(dtype)
+    tensor = samples.to("dgx").T
+    samples = samples.T
+    torch.testing.assert_close((tensor // 3).cpu(), samples // 3, rtol=0, atol=0)
+
+    divisors = torch.tensor([3, -3, 4, -4, 2, -2], dtype=dtype)
+    expected = torch.floor_divide(samples, divisors)
+    out = torch.empty((6, 7), dtype=dtype, device="dgx").T
+    returned = torch.floor_divide(tensor, divisors.to("dgx"), out=out)
+    assert returned is out
+    torch.testing.assert_close(out.cpu(), expected, rtol=0, atol=0)
+    assert tensor.floor_divide_(divisors.to("dgx")) is tensor
+    torch.testing.assert_close(tensor.cpu(), expected, rtol=0, atol=0)
+
+
+def test_floor_divide_integer_precision_and_promotion(dgx_setup_teardown):
+    samples = torch.tensor([-(2**63), -(2**53 + 7), -1, 0, 2**53 + 7, 2**63 - 1])
+    tensor = samples.to("dgx")
+    torch.testing.assert_close((tensor // 3).cpu(), samples // 3, rtol=0, atol=0)
+
+    samples = torch.arange(-7, 8)
+    tensor = samples.to("dgx")
+    torch.testing.assert_close((tensor // 2.5).cpu(), samples // 2.5, rtol=0, atol=0)
+
+
+def test_floor_divide_floating_edges(dgx_setup_teardown):
+    dividend = torch.tensor(
+        [1, -1, 1, -1, 0, -0.0, 0, 1, -1, float("inf"), float("nan")],
+        dtype=torch.float64,
+    )
+    divisor = torch.tensor(
+        [0.1, 0.1, -0.1, -0.1, -3, 3, 0, 0, 0, 3, 3], dtype=torch.float64
+    )
+    expected = torch.floor_divide(dividend, divisor)
+    actual = torch.floor_divide(dividend.to("dgx"), divisor.to("dgx")).cpu()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0, equal_nan=True)
+    zeros = expected == 0
+    assert torch.equal(torch.signbit(actual[zeros]), torch.signbit(expected[zeros]))
 
 
 @pytest.mark.parametrize(

@@ -91,7 +91,7 @@ void mse_loss_reduce_async(const Tensor& self, const Tensor& target, T normaliza
         C10_CUDA_CHECK(cudaMallocAsync(&partials[device], sizeof(T), stream));
 
         int64_t device_offset, device_numel;
-        std::tie(device_offset, device_numel) = chunk(self.numel(), device);
+        std::tie(device_offset, device_numel) = partition::range(self.numel(), device);
         if (device_numel)
         {
             auto logical_indices = thrust::make_counting_iterator<int64_t>(device_offset);
@@ -165,8 +165,6 @@ Tensor& mse_loss_out(const Tensor& self, const Tensor& target, int64_t reduction
         }
         else
         {
-            int current_device = cudaInvalidDeviceId;
-            C10_CUDA_CHECK(cudaGetDevice(&current_device));
             AT_DISPATCH_V2(common_dtype, "mse_loss_out", AT_WRAP([&] {
                                const auto normalization =
                                    reduction == Reduction::Mean ? scalar_t(1) / self_expanded.numel() : scalar_t(1);
@@ -174,7 +172,6 @@ Tensor& mse_loss_out(const Tensor& self, const Tensor& target, int64_t reduction
                                    self_expanded, target_expanded, normalization, reduction_out);
                            }),
                            AT_EXPAND(AT_FLOATING_TYPES), kHalf, kBFloat16);
-            C10_CUDA_CHECK(cudaSetDevice(current_device));
         }
 
         if (!out.is_same(reduction_out))

@@ -45,6 +45,15 @@ changes need view, resize, and copy coverage; generator changes need RNG replay
 and activation-checkpoint coverage. Record the actual versions and results in
 the release validation record.
 
+## Current CUDA device
+
+DGX operations, allocations, and tensor destruction may change the calling
+thread's current CUDA device. The backend does not restore the previous device
+or guarantee which CUDA device is current afterward. The logical device
+`dgx:0` does not select a physical CUDA device. Callers must select the
+intended CUDA device with `cudaSetDevice()` in C++ or `torch.cuda.set_device()`
+in Python before subsequent CUDA work that depends on the current device.
+
 ## Saved-state compatibility
 
 ### RNG representation

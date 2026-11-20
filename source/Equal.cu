@@ -77,9 +77,6 @@ bool equal(const Tensor& self, const Tensor& other)
     if (self.sizes() != other.sizes())
         return false;
 
-    int current_device = cudaInvalidDeviceId;
-    C10_CUDA_CHECK(cudaGetDevice(&current_device));
-
     Tensor device_outs = at::empty({ c10::cuda::device_count() }, self.options().dtype(kBool));
     Tensor out = at::empty({}, self.options().dtype(kBool));
     AT_DISPATCH_V2(self.scalar_type(), "equal", AT_WRAP([&] {
@@ -102,12 +99,7 @@ bool equal(const Tensor& self, const Tensor& other)
                    }),
                    AT_EXPAND(AT_ALL_TYPES), kBool, AT_EXPAND(AT_BAREBONES_UNSIGNED_TYPES));
 
-    const bool result = out.item<bool>();
-    // DGX allocation cleanup can change the current device.
-    out.reset();
-    device_outs.reset();
-    C10_CUDA_CHECK(cudaSetDevice(current_device));
-    return result;
+    return out.item<bool>();
 }
 
 TORCH_LIBRARY_IMPL(aten, PrivateUse1, m)

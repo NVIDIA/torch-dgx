@@ -30,6 +30,12 @@ struct ClampMinFunctor
     {
         out[tid] = std::max(self[tid], min);
     }
+
+    __device__ void operator()(size_t tid, const T* self, T min, T* out, StridedOffsetCalculator<2> offsets)
+    {
+        const auto tensor_offsets = offsets.get(tid);
+        out[tensor_offsets[1]] = std::max(self[tensor_offsets[0]], min);
+    }
 };
 
 template <class T>
@@ -38,6 +44,12 @@ struct ClampMaxFunctor
     __device__ void operator()(size_t tid, const T* self, T max, T* out)
     {
         out[tid] = std::min(self[tid], max);
+    }
+
+    __device__ void operator()(size_t tid, const T* self, T max, T* out, StridedOffsetCalculator<2> offsets)
+    {
+        const auto tensor_offsets = offsets.get(tid);
+        out[tensor_offsets[1]] = std::min(self[tensor_offsets[0]], max);
     }
 };
 
@@ -49,9 +61,10 @@ struct ClampFunctor
         out[tid] = std::min(std::max(self[tid], min), max);
     }
 
-    __device__ void operator()(size_t tid, const T* self, T* out)
+    __device__ void operator()(size_t tid, const T* self, T min, T max, T* out, StridedOffsetCalculator<2> offsets)
     {
-        out[tid] = self[tid];
+        const auto tensor_offsets = offsets.get(tid);
+        out[tensor_offsets[1]] = std::min(std::max(self[tensor_offsets[0]], min), max);
     }
 };
 
@@ -180,15 +193,21 @@ struct GeluBackwardFunctor
 
 Tensor& clamp_min_out(const Tensor& self, const Scalar& min, Tensor& out)
 {
-    TORCH_CHECK(self.is_contiguous());
-    TORCH_CHECK(out.is_contiguous());
-
-    auto iter = TensorIterator::unary_op(out, self);
+    TensorIterator iter;
+    iter.build_borrowing_unary_op(out, self);
     AT_DISPATCH_V2(iter.common_dtype(), "clamp_min_out", AT_WRAP([&] {
-                       using opmath_t = at::opmath_type<scalar_t>;
-                       mgpu_launch_func(iter.numel(), ClampMinFunctor<opmath_t>(),
-                                        static_cast<opmath_t*>(iter.data_ptr(1)), min.to<opmath_t>(),
-                                        static_cast<opmath_t*>(iter.data_ptr(0)));
+                       if (self.is_contiguous() && out.is_contiguous())
+                       {
+                           mgpu_launch_func(iter.numel(), ClampMinFunctor<scalar_t>(), self.const_data_ptr<scalar_t>(),
+                                            min.to<scalar_t>(), out.data_ptr<scalar_t>());
+                       }
+                       else
+                       {
+                           const auto offsets = make_strided_offset_calculator<2>(
+                               self.sizes(), std::array<IntArrayRef, 2>{ self.strides(), out.strides() });
+                           mgpu_launch_func(iter.numel(), ClampMinFunctor<scalar_t>(), self.const_data_ptr<scalar_t>(),
+                                            min.to<scalar_t>(), out.data_ptr<scalar_t>(), offsets);
+                       }
                    }),
                    AT_EXPAND(AT_ALL_TYPES));
 
@@ -197,15 +216,21 @@ Tensor& clamp_min_out(const Tensor& self, const Scalar& min, Tensor& out)
 
 Tensor& clamp_max_out(const Tensor& self, const Scalar& max, Tensor& out)
 {
-    TORCH_CHECK(self.is_contiguous());
-    TORCH_CHECK(out.is_contiguous());
-
-    auto iter = TensorIterator::unary_op(out, self);
+    TensorIterator iter;
+    iter.build_borrowing_unary_op(out, self);
     AT_DISPATCH_V2(iter.common_dtype(), "clamp_max_out", AT_WRAP([&] {
-                       using opmath_t = at::opmath_type<scalar_t>;
-                       mgpu_launch_func(iter.numel(), ClampMaxFunctor<opmath_t>(),
-                                        static_cast<opmath_t*>(iter.data_ptr(1)), max.to<opmath_t>(),
-                                        static_cast<opmath_t*>(iter.data_ptr(0)));
+                       if (self.is_contiguous() && out.is_contiguous())
+                       {
+                           mgpu_launch_func(iter.numel(), ClampMaxFunctor<scalar_t>(), self.const_data_ptr<scalar_t>(),
+                                            max.to<scalar_t>(), out.data_ptr<scalar_t>());
+                       }
+                       else
+                       {
+                           const auto offsets = make_strided_offset_calculator<2>(
+                               self.sizes(), std::array<IntArrayRef, 2>{ self.strides(), out.strides() });
+                           mgpu_launch_func(iter.numel(), ClampMaxFunctor<scalar_t>(), self.const_data_ptr<scalar_t>(),
+                                            max.to<scalar_t>(), out.data_ptr<scalar_t>(), offsets);
+                       }
                    }),
                    AT_EXPAND(AT_ALL_TYPES));
 
@@ -214,35 +239,31 @@ Tensor& clamp_max_out(const Tensor& self, const Scalar& max, Tensor& out)
 
 Tensor& clamp_out(const Tensor& self, const ::std::optional<Scalar>& min, const ::std::optional<Scalar>& max, Tensor& out)
 {
-    TORCH_CHECK(self.is_contiguous());
-    TORCH_CHECK(out.is_contiguous());
+    if (min && !max)
+        return clamp_min_out(self, *min, out);
+    if (max && !min)
+        return clamp_max_out(self, *max, out);
 
-    auto iter = TensorIterator::unary_op(out, self);
-    AT_DISPATCH_V2(
-        iter.common_dtype(), "clamp_out", AT_WRAP([&] {
-            using opmath_t = at::opmath_type<scalar_t>;
-            if (min && max)
-            {
-                mgpu_launch_func(iter.numel(), ClampFunctor<opmath_t>(), static_cast<opmath_t*>(iter.data_ptr(1)),
-                                 (*min).to<opmath_t>(), (*max).to<opmath_t>(), static_cast<opmath_t*>(iter.data_ptr(0)));
-            }
-            else if (min)
-            {
-                mgpu_launch_func(iter.numel(), ClampMinFunctor<opmath_t>(), static_cast<opmath_t*>(iter.data_ptr(1)),
-                                 (*min).to<opmath_t>(), static_cast<opmath_t*>(iter.data_ptr(0)));
-            }
-            else if (max)
-            {
-                mgpu_launch_func(iter.numel(), ClampMaxFunctor<opmath_t>(), static_cast<opmath_t*>(iter.data_ptr(1)),
-                                 (*max).to<opmath_t>(), static_cast<opmath_t*>(iter.data_ptr(0)));
-            }
-            else
-            {
-                mgpu_launch_func(iter.numel(), ClampFunctor<opmath_t>(), static_cast<opmath_t*>(iter.data_ptr(1)),
-                                 static_cast<opmath_t*>(iter.data_ptr(0)));
-            }
-        }),
-        AT_EXPAND(AT_ALL_TYPES));
+    TensorIterator iter;
+    iter.build_borrowing_unary_op(out, self);
+    if (!min && !max)
+        return out.copy_(self);
+
+    AT_DISPATCH_V2(iter.common_dtype(), "clamp_out", AT_WRAP([&] {
+                       if (self.is_contiguous() && out.is_contiguous())
+                       {
+                           mgpu_launch_func(iter.numel(), ClampFunctor<scalar_t>(), self.const_data_ptr<scalar_t>(),
+                                            min->to<scalar_t>(), max->to<scalar_t>(), out.data_ptr<scalar_t>());
+                       }
+                       else
+                       {
+                           const auto offsets = make_strided_offset_calculator<2>(
+                               self.sizes(), std::array<IntArrayRef, 2>{ self.strides(), out.strides() });
+                           mgpu_launch_func(iter.numel(), ClampFunctor<scalar_t>(), self.const_data_ptr<scalar_t>(),
+                                            min->to<scalar_t>(), max->to<scalar_t>(), out.data_ptr<scalar_t>(), offsets);
+                       }
+                   }),
+                   AT_EXPAND(AT_ALL_TYPES));
 
     return out;
 }
@@ -272,7 +293,7 @@ Tensor& threshold_backward_out(const Tensor& grad_output, const Tensor& self, co
     TORCH_CHECK(grad_output.sizes() == self.sizes(), "Expected grad_output and self to have the same shape");
     TORCH_CHECK(grad_output.scalar_type() == self.scalar_type() && grad_input.scalar_type() == self.scalar_type(),
                 "Expected grad_output, self, and grad_input to have the same dtype");
-    auto iter = TensorIterator::binary_op(grad_input, grad_output, self);
+    auto iter = TensorIterator::borrowing_binary_op(grad_input, grad_output, self);
 
     AT_DISPATCH_V2(
         iter.common_dtype(), "threshold_backward_out", AT_WRAP([&] {
@@ -299,7 +320,8 @@ Tensor& threshold_backward_out(const Tensor& grad_output, const Tensor& self, co
 Tensor& silu_out(const Tensor& self, Tensor& out)
 {
     TORCH_CHECK(out.scalar_type() == self.scalar_type(), "Expected out and self to have the same dtype");
-    auto iter = TensorIterator::unary_op(out, self);
+    TensorIterator iter;
+    iter.build_borrowing_unary_op(out, self);
     AT_DISPATCH_V2(iter.common_dtype(), "silu_out", AT_WRAP([&] {
                        if (self.is_contiguous() && out.is_contiguous())
                        {
@@ -323,7 +345,8 @@ Tensor& gelu_out(const Tensor& self, c10::string_view approximate, Tensor& out)
 {
     TORCH_CHECK(approximate == "none" || approximate == "tanh", "approximate argument must be either none or tanh");
     TORCH_CHECK(out.scalar_type() == self.scalar_type(), "Expected out and self to have the same dtype");
-    auto iter = TensorIterator::unary_op(out, self);
+    TensorIterator iter;
+    iter.build_borrowing_unary_op(out, self);
     const bool tanh_approximation = approximate == "tanh";
     AT_DISPATCH_V2(iter.common_dtype(), "gelu_out", AT_WRAP([&] {
                        const GeluFunctor<scalar_t> functor{ tanh_approximation };
@@ -350,7 +373,7 @@ Tensor& gelu_backward_out(const Tensor& grad_output, const Tensor& self, c10::st
     TORCH_CHECK(grad_output.sizes() == self.sizes(), "Expected grad_output and self to have the same shape");
     TORCH_CHECK(grad_output.scalar_type() == self.scalar_type() && grad_input.scalar_type() == self.scalar_type(),
                 "Expected grad_output, self, and grad_input to have the same dtype");
-    auto iter = TensorIterator::binary_op(grad_input, grad_output, self);
+    auto iter = TensorIterator::borrowing_binary_op(grad_input, grad_output, self);
     const bool tanh_approximation = approximate == "tanh";
     AT_DISPATCH_V2(
         iter.common_dtype(), "gelu_backward_out", AT_WRAP([&] {

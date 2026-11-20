@@ -6,16 +6,21 @@
 
 #include <c10/cuda/CUDAStream.h>
 
+#include <ATen/AccumulateType.h>
 #include <ATen/Dispatch_v2.h>
-#include <ATen/native/ReduceOpsUtils.h>
+#include <ATen/MemoryOverlap.h>
+#include <ATen/WrapDimUtils.h>
+#include <ATen/native/Resize.h>
 #include <ATen/ops/empty.h>
 
 #include <torch/library.h>
 
+#include <cub/block/block_scan.cuh>
 #include <cub/device/device_reduce.cuh>
 #include <cub/device/device_scan.cuh>
 #include <cub/util_type.cuh>
 #include <cub/warp/warp_scan.cuh>
+#include <cuda/std/functional>
 
 // Define utility macro used to call CUB functions that use dynamic temporary storage
 #ifndef CUB_LAUNCH
@@ -48,6 +53,73 @@ namespace
 {
 
 constexpr int kWarpSize = 32;
+
+template <typename scalar_t>
+__global__ void cumprod_rows_kernel(
+    const scalar_t* input, scalar_t* output, int64_t size, int64_t row_offset, int64_t row_count)
+{
+    using acc_t = acc_type<scalar_t, true>;
+    using BlockScan = cub::BlockScan<acc_t, kNumThreads>;
+    __shared__ typename BlockScan::TempStorage temp_storage;
+    for (int64_t row = blockIdx.x; row < row_count; row += gridDim.x)
+    {
+        acc_t carry = acc_t(1);
+        const int64_t offset = (row_offset + row) * size;
+        for (int64_t start = 0; start < size; start += blockDim.x)
+        {
+            const int64_t col = start + threadIdx.x;
+            acc_t value = col < size ? static_cast<acc_t>(input[offset + col]) : acc_t(1);
+            acc_t total;
+            BlockScan(temp_storage).InclusiveScan(value, value, ::cuda::std::multiplies<acc_t>{}, total);
+            if (col < size)
+            {
+                output[offset + col] = static_cast<scalar_t>(carry * value);
+            }
+            carry *= total;
+            __syncthreads();
+        }
+    }
+}
+
+template <typename scalar_t>
+__global__ void cumsum_dim_kernel(
+    int64_t row_offset, int64_t num_rows, int64_t dim_size, int64_t inner, const scalar_t* input, scalar_t* output)
+{
+    using acc_t = acc_type<scalar_t, true>;
+    using BlockScan = cub::BlockScan<acc_t, kNumThreads>;
+    __shared__ typename BlockScan::TempStorage temp_storage;
+    __shared__ acc_t carry;
+
+    for (int64_t row = blockIdx.x; row < num_rows; row += gridDim.x)
+    {
+        const auto index = row_offset + row;
+        const auto base = (index / inner) * dim_size * inner + index % inner;
+        if (threadIdx.x == 0)
+        {
+            carry = acc_t(0);
+        }
+        __syncthreads();
+
+        for (int64_t start = 0; start < dim_size; start += kNumThreads)
+        {
+            const auto column = start + threadIdx.x;
+            const acc_t value = column < dim_size ? static_cast<acc_t>(input[base + column * inner]) : acc_t(0);
+            acc_t prefix, total;
+            BlockScan(temp_storage).InclusiveSum(value, prefix, total);
+            if (column < dim_size)
+            {
+                output[base + column * inner] = static_cast<scalar_t>(carry + prefix);
+            }
+            // Finish reading carry and scan storage before updating either.
+            __syncthreads();
+            if (threadIdx.x == 0)
+            {
+                carry += total;
+            }
+            __syncthreads();
+        }
+    }
+}
 
 template <typename T>
 __global__ void exclusive_warp_sum_kernel(const T* input, T* output, int64_t count)
@@ -147,20 +219,61 @@ void inclusive_sum_async(const T* in, T* out, int64_t* counts, T* block_totals, 
 
 Tensor& cumsum_out(const Tensor& self, int64_t dim, std::optional<ScalarType> dtype, Tensor& out)
 {
-    int device = cudaInvalidDeviceId;
-    C10_CUDA_CHECK(cudaGetDevice(&device));
+    dim = at::maybe_wrap_dim(dim, self.dim());
+    TORCH_CHECK(out.device() == self.device(), "cumsum: output must be on the input device");
+    TORCH_CHECK(!dtype || *dtype == out.scalar_type(), "cumsum: output must have the requested dtype");
+    at::native::resize_output(out, self.sizes());
+    at::assert_no_internal_overlap(out);
+    at::assert_no_partial_overlap(out, self);
+    if (self.numel() == 0)
+    {
+        return out;
+    }
 
-    TORCH_CHECK(self.dim() == 1, "dgx cumsum only supports 1D inputs")
-    TORCH_CHECK(dim == 0, "dgx cumsum only supports cumulative summation along the zeroth dimension");
+    auto in = self.to(out.scalar_type()).contiguous();
+    auto result = out.is_contiguous() ? out : at::empty(self.sizes(), out.options());
+
+    if (self.dim() != 1 || out.scalar_type() == kHalf || out.scalar_type() == kBFloat16 || out.is_complex())
+    {
+        const auto dim_size = self.dim() == 0 ? 1 : self.size(dim);
+        int64_t inner = 1;
+        for (int64_t axis = dim + 1; axis < self.dim(); ++axis)
+        {
+            inner *= self.size(axis);
+        }
+        const auto num_rows = self.numel() / dim_size;
+
+        AT_DISPATCH_V2(out.scalar_type(), "cumsum_dim_out", AT_WRAP([&] {
+                           parallel_for_each([&](int device, cudaStream_t stream) {
+                               size_t offset, count;
+                               std::tie(offset, count) = partition::range(num_rows, device);
+                               if (count == 0)
+                               {
+                                   return;
+                               }
+                               const auto num_blocks = static_cast<unsigned int>(std::min<int64_t>(count, 65535));
+                               cumsum_dim_kernel<<<num_blocks, kNumThreads, 0, stream>>>(offset, count, dim_size, inner,
+                                                                                         in.const_data_ptr<scalar_t>(),
+                                                                                         result.data_ptr<scalar_t>());
+                               C10_CUDA_KERNEL_LAUNCH_CHECK();
+                           });
+                       }),
+                       AT_EXPAND(AT_ALL_TYPES), kHalf, kBFloat16, kComplexFloat, kComplexDouble);
+
+        if (!out.is_contiguous())
+        {
+            out.copy_(result);
+        }
+        return out;
+    }
+
     TORCH_CHECK(c10::cuda::device_count() <= kWarpSize, "dgx cumsum supports at most ", kWarpSize, " CUDA devices");
 
     std::vector<int64_t> device_numels(c10::cuda::device_count());
     for (const auto device_id : c10::irange(c10::cuda::device_count()))
     {
-        std::tie(std::ignore, device_numels[device_id]) = chunk(self.numel(), device_id);
+        std::tie(std::ignore, device_numels[device_id]) = partition::range(self.numel(), device_id);
     }
-
-    auto in = self.to(get_dtype_from_self(self, dtype, true));
 
     C10_CUDA_CHECK(cudaSetDevice(0));
     auto block_totals = at::empty({ c10::cuda::device_count() }, out.options());
@@ -168,20 +281,63 @@ Tensor& cumsum_out(const Tensor& self, int64_t dim, std::optional<ScalarType> dt
 
     AT_DISPATCH_V2(out.scalar_type(), "cumsum_out", AT_WRAP([&] {
                        const auto input = in.const_data_ptr<scalar_t>();
-                       auto output = out.data_ptr<scalar_t>();
+                       auto output = result.data_ptr<scalar_t>();
                        inclusive_sum_async(input, output, device_numels.data(), block_totals.data_ptr<scalar_t>(),
                                            block_offsets.data_ptr<scalar_t>());
                    }),
                    AT_EXPAND(AT_ALL_TYPES));
 
-    C10_CUDA_CHECK(cudaSetDevice(device));
-
+    if (!out.is_contiguous())
+    {
+        out.copy_(result);
+    }
     return out;
+}
+
+Tensor& cumprod_out(const Tensor& self, int64_t dim, std::optional<ScalarType> dtype, Tensor& out)
+{
+    dim = maybe_wrap_dim(dim, self.dim());
+    TORCH_CHECK(out.device() == self.device(), "cumprod: output must be on the input device");
+    TORCH_CHECK(!dtype || *dtype == out.scalar_type(), "cumprod dtype must match the output dtype");
+    out.resize_(self.sizes());
+    assert_no_internal_overlap(out);
+    if (!self.numel())
+    {
+        return out;
+    }
+    if (!self.dim())
+    {
+        return out.copy_(self);
+    }
+
+    // Scan independent contiguous rows, keeping complete rows on each GPU.
+    // A separate result also makes out= aliases safe and supports strided outputs.
+    const auto input = self.to(out.scalar_type()).movedim(dim, -1).contiguous();
+    auto result = at::empty(input.sizes(), out.options());
+    const int64_t size = input.size(-1);
+    const int64_t rows = input.numel() / size;
+    AT_DISPATCH_V2(out.scalar_type(), "cumprod_out", AT_WRAP([&] {
+                       parallel_for_each([&](int device, cudaStream_t stream) {
+                           size_t offset, count;
+                           std::tie(offset, count) = partition::range(rows, device);
+                           if (!count)
+                           {
+                               return;
+                           }
+                           const unsigned int blocks = static_cast<unsigned int>(std::min<int64_t>(count, 4096));
+                           cumprod_rows_kernel<<<blocks, kNumThreads, 0, stream>>>(
+                               input.const_data_ptr<scalar_t>(), result.data_ptr<scalar_t>(), size, offset, count);
+                           C10_CUDA_KERNEL_LAUNCH_CHECK();
+                       });
+                   }),
+                   AT_EXPAND(AT_ALL_TYPES), kBool, kHalf, kBFloat16, kComplexFloat, kComplexDouble);
+    return out.copy_(result.movedim(-1, dim));
 }
 
 TORCH_LIBRARY_IMPL(aten, PrivateUse1, m)
 {
     m.impl(TORCH_SELECTIVE_NAME("aten::cumsum.out"), TORCH_FN(cumsum_out));
+    m.impl(TORCH_SELECTIVE_NAME("aten::cumprod.out"), TORCH_FN(cumprod_out));
 }
 
 } // namespace dgx

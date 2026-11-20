@@ -104,7 +104,9 @@ def test_addmm_input_layouts(
 
 
 @pytest.mark.parametrize("dtype", datatypes, ids=str)
-@pytest.mark.parametrize("layout", ["resize", "transpose", "strided", "inplace"])
+@pytest.mark.parametrize(
+    "layout", ["resize", "transpose", "strided", "offset", "inplace"]
+)
 @pytest.mark.parametrize("beta", [0.0, 1.0, -0.3])
 def test_addmm_out_layout(dgx_setup_teardown, dtype, layout, beta):
     mat1 = torch.randn((17, 13), dtype=dtype, device="dgx")
@@ -112,6 +114,8 @@ def test_addmm_out_layout(dgx_setup_teardown, dtype, layout, beta):
     bias = torch.randn(
         (17, 19) if layout == "inplace" else (19,), dtype=dtype, device="dgx"
     )
+    if beta == 0:
+        bias.fill_(float("nan"))
     if layout == "resize":
         out = torch.empty(0, dtype=dtype, device="dgx")
     elif layout == "transpose":
@@ -119,6 +123,8 @@ def test_addmm_out_layout(dgx_setup_teardown, dtype, layout, beta):
     elif layout == "strided":
         backing = torch.full((17, 38), -123.0, dtype=dtype, device="dgx")
         out = backing[:, ::2]
+    elif layout == "offset":
+        out = torch.empty(17 * 19 + 1, dtype=dtype, device="dgx")[1:].view(17, 19)
     else:
         out = bias
     expected = torch.addmm(bias.cpu(), mat1.cpu(), mat2.cpu(), beta=beta, alpha=0.7)

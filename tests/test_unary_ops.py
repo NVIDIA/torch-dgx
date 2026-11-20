@@ -67,6 +67,27 @@ def test_isnan_non_contiguous(dgx_setup_teardown, dtype):
     assert torch.equal(torch.isnan(tensor).to("cpu"), torch.isnan(tensor.to("cpu")))
 
 
+@pytest.mark.parametrize(
+    "dtype", [torch.float16, torch.bfloat16, torch.float32, torch.float64], ids=str
+)
+@pytest.mark.parametrize(
+    "replacements", [{}, {"nan": -2.5, "posinf": 7.0, "neginf": -9.0}]
+)
+def test_nan_to_num(dgx_setup_teardown, dtype, replacements):
+    source = torch.tensor(
+        [float("nan"), float("inf"), -float("inf"), -2.0], dtype=dtype
+    )
+    input = source.to("dgx")
+    expected = torch.nan_to_num(source, **replacements)
+
+    torch.testing.assert_close(torch.nan_to_num(input, **replacements).cpu(), expected)
+    out = torch.empty(0, dtype=dtype, device="dgx")
+    assert torch.nan_to_num(input, out=out, **replacements) is out
+    torch.testing.assert_close(out.cpu(), expected)
+    assert input.nan_to_num_(**replacements) is input
+    torch.testing.assert_close(input.cpu(), expected)
+
+
 @pytest.mark.parametrize("dtype", datatypes, ids=str)
 def test_logit(dgx_setup_teardown, dtype):
     tensor = torch.mul(torch.rand(3, 4, dtype=dtype).to("dgx"), 0.7)
@@ -187,7 +208,11 @@ def test_gelu_backward(dgx_setup_teardown, dtype, approximate, grad_output_layou
 
 @pytest.mark.parametrize("dtype", datatypes, ids=str)
 def test_clamp_min(dgx_setup_teardown, dtype):
-    sample_inputs = [(torch.normal(0, 1, (19, 3), dtype=dtype).to("dgx"), 0.1)]
+    sample_inputs = [
+        (torch.normal(0, 1, (19, 3), dtype=dtype).to("dgx"), 0.1),
+        (torch.normal(0, 1, (19, 3), dtype=dtype).to("dgx").t(), 0.1),
+        (torch.normal(0, 1, (19, 7), dtype=dtype).to("dgx")[1::2, 1::2], 0.1),
+    ]
 
     for args in sample_inputs:
         opcheck(torch.ops.aten.clamp_min.default, args)
@@ -200,7 +225,11 @@ def test_clamp_min(dgx_setup_teardown, dtype):
 
 @pytest.mark.parametrize("dtype", datatypes, ids=str)
 def test_clamp_max(dgx_setup_teardown, dtype):
-    sample_inputs = [(torch.normal(0, 1, (19, 3), dtype=dtype).to("dgx"), -0.2)]
+    sample_inputs = [
+        (torch.normal(0, 1, (19, 3), dtype=dtype).to("dgx"), -0.2),
+        (torch.normal(0, 1, (19, 3), dtype=dtype).to("dgx").t(), -0.2),
+        (torch.normal(0, 1, (19, 7), dtype=dtype).to("dgx")[1::2, 1::2], -0.2),
+    ]
 
     for args in sample_inputs:
         opcheck(torch.ops.aten.clamp_max.default, args)
@@ -216,6 +245,10 @@ def test_clamp(dgx_setup_teardown, dtype):
     sample_inputs = [
         (torch.normal(0, 1, (19, 3), dtype=dtype).to("dgx"), -0.2, 0.3),
         (torch.normal(0, 1, (15, 2, 2), dtype=dtype).to("dgx"), 0.4, 0.05),
+        (torch.normal(0, 1, (19, 3), dtype=dtype).to("dgx").t(), -0.2, 0.3),
+        (torch.normal(0, 1, (19, 7), dtype=dtype).to("dgx")[1::2, 1::2], -0.2, 0.3),
+        (torch.normal(0, 1, (19, 3), dtype=dtype).to("dgx").t(), 0.1, None),
+        (torch.normal(0, 1, (19, 7), dtype=dtype).to("dgx")[1::2, 1::2], None, -0.2),
     ]
 
     for args in sample_inputs:
