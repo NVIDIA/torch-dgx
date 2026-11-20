@@ -223,9 +223,11 @@ Tensor& avg_pool2d_backward_out(const Tensor& grad_output,
     TORCH_CHECK(!divisor_override.has_value() || *divisor_override != 0, "avg_pool2d_backward: divisor must be nonzero");
     const int64_t output_h = pooling_output_shape<int64_t>(self.size(-2), kernel_h, pad_h, stride_h, 1, ceil_mode);
     const int64_t output_w = pooling_output_shape<int64_t>(self.size(-1), kernel_w, pad_w, stride_w, 1, ceil_mode);
-    avg_pool2d_backward_shape_check(self, grad_output, self.dim() == 4 ? self.size(0) : 1, kernel_h, kernel_w, stride_h,
-                                    stride_w, pad_h, pad_w, self.size(-3), self.size(-2), self.size(-1), output_h,
-                                    output_w, self.suggest_memory_format());
+    pool2d_shape_check(self, kernel_h, kernel_w, stride_h, stride_w, pad_h, pad_w, 1, 1, self.size(-3), self.size(-2),
+                       self.size(-1), output_h, output_w, self.suggest_memory_format());
+    check_dim_size(grad_output, self.dim(), self.dim() - 3, self.size(-3));
+    check_dim_size(grad_output, self.dim(), self.dim() - 2, output_h);
+    check_dim_size(grad_output, self.dim(), self.dim() - 1, output_w);
     TORCH_CHECK(self.dim() != 4 || grad_output.size(0) == self.size(0),
                 "avg_pool2d_backward: grad_output batch size must match the input");
 
